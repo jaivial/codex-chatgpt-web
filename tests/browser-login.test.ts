@@ -19,7 +19,7 @@ test("login starts with normal Chrome and captures state in a headed Keychain-aw
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "browser", "storage-state.json");
-    await loginToChatGpt(config, { timeoutMs: 100, loginHeadless: "off" }).catch(() => {});
+    await loginToChatGpt(config, { timeoutMs: 100 }).catch(() => {});
 
     const launches = readFileSync(argsLog, "utf8").trim().split("\n");
     const firstLaunch = launches[0] ?? "";
