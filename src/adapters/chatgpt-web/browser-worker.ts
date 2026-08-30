@@ -87,7 +87,10 @@ import {
 import {
   chatGptExternalProgressIsLive,
 } from "./turn-progress";
-import type { ChatGptTurnProgressReader } from "./turn-progress";
+import type {
+  ChatGptExternalTurnProgressSnapshot,
+  ChatGptTurnProgressReader,
+} from "./turn-progress";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
@@ -1113,7 +1116,6 @@ export function chatGptExternalProgressSuppressesDomHealth(
   return age >= -CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS
     && age < CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
 }
-
 
 export class ChatGptStoppedThinkingTracker {
   private visibleSince?: number;
@@ -2653,10 +2655,9 @@ export class ChatGptBrowserWorker {
           snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
         }
       }
-      const externalProgressLive = chatGptExternalProgressIsLive(
+      const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
         externalProgress?.snapshot(),
         Date.now(),
-        CHATGPT_RESPONSE_DOM_GRACE_MS,
       );
       if (externalProgressLive) stoppedThinkingTracker.clear();
       else if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible)) {
