@@ -2549,3 +2549,4 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   expect(tryStart).toBeGreaterThan(0);
   expect(heartbeat).toBeLessThan(tryStart);
 });
+
