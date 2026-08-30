@@ -2261,11 +2261,9 @@ test("the launcher helper transport carries MCP progress into the out-of-process
 
 test("turn cancellation heuristics defer to proven MCP progress in both wait loops", () => {
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
-  const guarded = worker.match(/stoppedThinkingTracker\.update\([^)]*\)\s*&&\s*!externalProgressLive/g) ?? [];
-
   // A stale "Stopped thinking" label must not cancel a turn that is still driving tool calls, and
   // the multipart staging loop must not be the one place that skips the liveness guard.
-  expect(guarded.length).toBe(2);
+  expect((worker.match(/stoppedThinkingTracker\.clear\(\)/g) ?? []).length).toBe(2);
   expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(2);
 });
 
@@ -2548,3 +2546,5 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   expect(heartbeat).toBeGreaterThan(0);
   expect(heartbeat).toBeLessThan(tryStart);
 });
+
+

@@ -353,8 +353,10 @@ input.on("line", line => {
     sendActivationWaiters.delete(message.id);
     waiter.resolve();
   } else if (message.type === "progress") {
-    // Progress can arrive before the run frame is processed, so the mirror is created on demand
-    // rather than requiring an established turn.
+    // Progress is only meaningful for a turn this helper is actually running. Creating a mirror
+    // for any unrecognised id let late, malformed, or misaddressed frames grow this map without
+    // bound, since nothing would ever remove an entry that has no turn to end it.
+    if (!abortControllers.has(message.id)) return;
     const progress = turnProgress.get(message.id) ?? new ChatGptMirroredTurnProgress();
     turnProgress.set(message.id, progress);
     try {

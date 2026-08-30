@@ -1051,6 +1051,17 @@ export function chatGptExternalProgressSuppressesDomHealth(
 export class ChatGptStoppedThinkingTracker {
   private visibleSince?: number;
 
+  /**
+   * Forgets an in-progress "Stopped thinking" window.
+   *
+   * Suppressing only the throw let the window keep accruing while a tool call was outstanding, so
+   * the first observation after progress ended cancelled the turn instantly. Proven activity must
+   * reset the evidence, not merely postpone acting on it.
+   */
+  clear(): void {
+    this.visibleSince = undefined;
+  }
+
   constructor(private readonly graceMs = CHATGPT_STOPPED_THINKING_GRACE_MS) {
     if (!Number.isFinite(graceMs) || graceMs < 0) {
       throw new Error("ChatGPT Stopped thinking grace must be a non-negative finite number");
@@ -2175,7 +2186,8 @@ export class ChatGptBrowserWorker {
       if (deadline !== undefined && Date.now() >= deadline) {
         throw new Error("ChatGPT web turn timed out");
       }
-      if (Date.now() >= responseDeadline && (progress?.activeToolCalls ?? 0) === 0) {
+      if (Date.now() >= responseDeadline
+        && !chatGptExternalProgressSuppressesDomHealth(progress, Date.now())) {
         throw new Error("ChatGPT accepted the message but did not expose its assistant turn in the DOM");
       }
       await throwIfChatGptSessionFailureAlert(page);
@@ -2564,7 +2576,8 @@ export class ChatGptBrowserWorker {
         Date.now(),
         CHATGPT_RESPONSE_DOM_GRACE_MS,
       );
-      if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible) && !externalProgressLive) {
+      if (externalProgressLive) stoppedThinkingTracker.clear();
+      else if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible)) {
         throw chatGptStoppedThinkingError();
       }
       if (!snapshot.responsePresent && externalProgressLive) {
@@ -3557,6 +3570,7 @@ export class ChatGptBrowserWorker {
             stageBaseline,
             deadline,
             turn.abortSignal,
+            turn.externalProgress,
           );
           console.info(
             `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length} submission accepted evidence=${evidence}`,
@@ -3706,6 +3720,8 @@ export class ChatGptBrowserWorker {
       const stoppedThinkingTracker = new ChatGptStoppedThinkingTracker();
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
+      let internalObservationFaults = 0;
+      let observedThisIteration = false;
       for (;;) {
         // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
         // a defect in the caller must not be retried as though the page could not be read.
@@ -3738,6 +3754,7 @@ export class ChatGptBrowserWorker {
           CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS,
           () => diagnostics.capture(page, "tool-confirmation-visible"),
         )) {
+          internalObservationFaults = 0;
           await pollSleep();
           continue;
         }
@@ -3781,14 +3798,20 @@ export class ChatGptBrowserWorker {
           }
         }
         if (snapshot.responsePresent) consecutiveObservationRebinds = 0;
-        const externalProgressLive = chatGptExternalProgressIsLive(
+        // The page was read successfully, so the fault budget is genuinely consecutive even when
+        // this iteration goes on to `continue` for a rebind, confirmation, or liveness pause.
+        internalObservationFaults = 0;
+        observedThisIteration = true;
+        // Liveness may postpone a verdict, never waive it: once activity goes stale the DOM alone
+        // decides, so a tool call that never returns cannot hold an undeadlined turn open forever.
+        const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
           turn.externalProgress?.snapshot(),
           Date.now(),
-          CHATGPT_RESPONSE_DOM_GRACE_MS,
         );
         // A stale "Stopped thinking" label is not terminal while the model is still driving tool
-        // calls, so the tracker keeps observing but may not cancel the turn.
-        if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible) && !externalProgressLive) {
+        // calls, and the window must be forgotten rather than merely ignored.
+        if (externalProgressLive) stoppedThinkingTracker.clear();
+        else if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible)) {
           throw chatGptStoppedThinkingError();
         }
         if (!snapshot.responsePresent && externalProgressLive) {
@@ -3891,7 +3914,10 @@ export class ChatGptBrowserWorker {
        } catch (error) {
         // Only a defect in this worker is retried here. Every deliberate signal — adapter errors,
         // aborts, closed tabs, DOM-health verdicts — still fails the turn immediately.
-        if (!(error instanceof TypeError)) throw error;
+        // Retry only faults raised while reading the page. Once observation succeeded, a
+        // TypeError belongs to a consumer - Markdown buffering, text/trace callbacks, checkpoint
+        // capture - and retrying it would rerun an iteration whose side effects already happened.
+        if (!(error instanceof TypeError) || observedThisIteration) throw error;
         internalObservationFaults += 1;
         if (internalObservationFaults > MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS) {
           throw new Error(
