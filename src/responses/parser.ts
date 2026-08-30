@@ -365,20 +365,17 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           agentMessage.content as unknown[] | string | undefined,
         );
 
-        const hasContent =
-          typeof content === "string"
-            ? content.trim().length > 0
-            : content.length > 0;
-
-        // An agent_message is external input delivered to the parent agent.
-        // Preserve it as a user-role turn so signed reasoning blocks
-        // on either side are never merged into one modified assistant response.
+        // An agent_message is external input delivered to the parent agent. Keep its distinct
+        // role and routing metadata so Web history remains semantically equivalent to Responses.
         pendingReasoning.length = 0;
-        messages.push({
-          role: "user",
-          content: hasContent ? content : "(sub-agent message received)",
+        const message: CodexAgentMessage = {
+          role: "agentMessage",
+          ...(typeof agentMessage.author === "string" ? { author: agentMessage.author } : {}),
+          ...(typeof agentMessage.recipient === "string" ? { recipient: agentMessage.recipient } : {}),
+          content,
           timestamp: now,
-        });
+        };
+        messages.push(message);
 
         continue;
       }
