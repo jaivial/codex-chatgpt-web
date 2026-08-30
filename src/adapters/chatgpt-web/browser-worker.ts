@@ -106,6 +106,15 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 }
 
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
+/**
+ * How long a staged Bigger Context part may take to produce its assistant turn. A staged part is two
+ * orders of magnitude larger than an ordinary prompt and ChatGPT reads all of it before answering,
+ * so the ordinary grace is not a budget it can be held to: acknowledgements have been observed at
+ * 19s and 30s on the same payload that once took over 72s and lost the turn. There is no MCP
+ * activity to vouch for liveness yet at this point, so this window is the only thing standing
+ * between a slow ingest and a cancelled turn. It matches the staged send budget.
+ */
+export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
@@ -628,7 +637,7 @@ export function resolveChatGptWebMultipartStagingMode(
   );
 }
 
-const browserStageTimeouts = {
+export const browserStageTimeouts = {
   browserPage: 60_000,
   temporaryChatPreparation: 150_000,
   effortSelection: 120_000,
@@ -2173,10 +2182,11 @@ export class ChatGptBrowserWorker {
     deadline: number | undefined,
     signal?: AbortSignal,
     externalProgress?: ChatGptTurnProgressReader,
+    graceMs: number = CHATGPT_RESPONSE_DOM_GRACE_MS,
   ): Promise<ChatGptAssistantTurnBinding> {
     let responseDeadline = Math.min(
       deadline ?? Number.POSITIVE_INFINITY,
-      Date.now() + CHATGPT_RESPONSE_DOM_GRACE_MS,
+      Date.now() + graceMs,
     );
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -2185,7 +2195,7 @@ export class ChatGptBrowserWorker {
       if (progress?.lastProgressAt !== undefined) {
         responseDeadline = Math.min(
           deadline ?? Number.POSITIVE_INFINITY,
-          Math.max(responseDeadline, progress.lastProgressAt + CHATGPT_RESPONSE_DOM_GRACE_MS),
+          Math.max(responseDeadline, progress.lastProgressAt + graceMs),
         );
       }
       if (deadline !== undefined && Date.now() >= deadline) {
@@ -2201,7 +2211,7 @@ export class ChatGptBrowserWorker {
       try {
         state = await this.submissionDomState(page, baseline.domCache);
       } catch (error) {
-        if (!chatGptExternalProgressIsLive(progress, Date.now(), CHATGPT_RESPONSE_DOM_GRACE_MS)) throw error;
+        if (!chatGptExternalProgressIsLive(progress, Date.now(), graceMs)) throw error;
         await this.waitForTurnDomOrExternalProgress(
           page,
           progress?.revision ?? 0,
@@ -3575,7 +3585,10 @@ export class ChatGptBrowserWorker {
             stageBaseline,
             deadline,
             turn.abortSignal,
-            turn.externalProgress,
+            // A part still being ingested has produced no MCP activity, so there is no progress to
+            // consult here; only the wider window applies.
+            undefined,
+            CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
           );
           console.info(
             `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length} submission accepted evidence=${evidence}`,
