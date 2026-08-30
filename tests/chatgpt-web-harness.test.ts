@@ -10,8 +10,8 @@ import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-erro
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
-import { chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
@@ -2798,4 +2798,228 @@ describe("ChatGPT outer-native harness v4", () => {
       await broker.close();
     }
   }, 10_000);
+});
+
+test("mirrored turn progress carries daemon MCP activity into the browser helper process", async () => {
+  const daemon = new ChatGptExternalTurnProgress();
+  const mirror = new ChatGptMirroredTurnProgress();
+
+  // A helper process with no mirrored progress reports "not live", which is exactly what let the
+  // DOM grace cancel turns whose tool calls were still completing.
+  expect(chatGptExternalProgressIsLive(mirror.snapshot(), 1_000, 60_000)).toBeFalse();
+
+  daemon.recordToolBatch(1, 1_000);
+  expect(mirror.apply(daemon.snapshot())).toBeTrue();
+  expect(chatGptExternalProgressIsLive(mirror.snapshot(), 30_000, 60_000)).toBeTrue();
+
+  daemon.recordToolResult(2_000);
+  expect(mirror.apply(daemon.snapshot())).toBeTrue();
+  expect(mirror.snapshot()).toEqual({
+    revision: 2,
+    lastToolBatchRevision: 1,
+    activeToolCalls: 0,
+    lastProgressAt: 2_000,
+  });
+
+  // Liveness still expires on the mirrored timestamp once the model genuinely stops working.
+  expect(chatGptExternalProgressIsLive(mirror.snapshot(), 61_999, 60_000)).toBeTrue();
+  expect(chatGptExternalProgressIsLive(mirror.snapshot(), 62_000, 60_000)).toBeFalse();
+});
+
+test("mirrored turn progress ignores replayed frames and rejects malformed ones", async () => {
+  const mirror = new ChatGptMirroredTurnProgress();
+  const first = { revision: 4, lastToolBatchRevision: 3, activeToolCalls: 1, lastProgressAt: 5_000 };
+
+  expect(mirror.apply(first)).toBeTrue();
+  expect(mirror.apply(first)).toBeFalse();
+  expect(mirror.apply({
+    revision: 2,
+    lastToolBatchRevision: 2,
+    activeToolCalls: 1,
+    lastProgressAt: 1_000,
+  })).toBeFalse();
+  expect(mirror.snapshot().lastProgressAt).toBe(5_000);
+
+  expect(() => mirror.apply({ ...first, revision: -1 })).toThrow("snapshot is invalid");
+  expect(() => mirror.apply({ ...first, revision: 5, lastToolBatchRevision: 9 })).toThrow("snapshot is invalid");
+});
+
+test("mirrored turn progress wakes waiters exactly like the recording instance", async () => {
+  const mirror = new ChatGptMirroredTurnProgress();
+  const changed = mirror.waitForChange(0);
+  mirror.apply({ revision: 1, lastToolBatchRevision: 1, activeToolCalls: 2, lastProgressAt: 7_000 });
+  expect(await changed).toEqual({
+    revision: 1,
+    lastToolBatchRevision: 1,
+    activeToolCalls: 2,
+    lastProgressAt: 7_000,
+  });
+});
+
+test("mirrored progress rejects frames that regress against the observed state", async () => {
+  const mirror = new ChatGptMirroredTurnProgress();
+  mirror.apply({ revision: 3, lastToolBatchRevision: 3, activeToolCalls: 1, lastProgressAt: 5_000 });
+
+  // Higher revision but contradicting what it already reported: a corrupt or forged frame, not an
+  // ordering artefact, and accepting it would desynchronise observed liveness.
+  expect(() => mirror.apply({
+    revision: 4, lastToolBatchRevision: 2, activeToolCalls: 1, lastProgressAt: 6_000,
+  })).toThrow("regressed against the observed state");
+  expect(() => mirror.apply({
+    revision: 4, lastToolBatchRevision: 3, activeToolCalls: 1, lastProgressAt: 4_000,
+  })).toThrow("regressed against the observed state");
+
+  // Recorded activity always stamps a timestamp, so a progress frame without one is malformed.
+  expect(() => mirror.apply({
+    revision: 5, lastToolBatchRevision: 3, activeToolCalls: 0,
+  })).toThrow("snapshot is invalid");
+
+  expect(mirror.snapshot()).toEqual({
+    revision: 3, lastToolBatchRevision: 3, activeToolCalls: 1, lastProgressAt: 5_000,
+  });
+});
+
+test("an interrupted turn's abort notice is not mistaken for the next turn's instruction", () => {
+  // Reproduces a real failure: the user stopped a turn, Codex appended <turn_aborted> carrying the
+  // interrupted turn's id, and the next turn read that notice as its own user revision. The ids
+  // disagreed and every following turn failed with a turn_id conflict.
+  const request = rawWireRequest(environmentXml);
+  const abortedNotice = "<turn_aborted>\nThe user interrupted the previous turn on purpose."
+    + " Any running unified exec processes may still be running in the background."
+    + "\n</turn_aborted>";
+  ((request._rawBody as { input: unknown[] }).input).push({
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: abortedNotice }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_test_interrupted" },
+  });
+
+  // The instruction actually owned by this turn is still the human one that precedes the notice.
+  expect(extractChatGptTurnUserRevision(request)).toEqual([
+    { type: "input_text", text: "Inspect the project" },
+  ]);
+
+  // A genuine steering message from a foreign turn must still be rejected.
+  const steered = structuredClone(request);
+  ((steered._rawBody as { input: unknown[] }).input).push({
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "Actually, stop and summarise instead" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_test_other" },
+  });
+  expect(() => extractChatGptTurnUserRevision(steered))
+    .toThrow(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
+});
+
+describe("adapter liveness covers every path through a turn", () => {
+  // The Responses bridge cancels a turn after DEFAULT_STALL_TIMEOUT_SEC without a single adapter
+  // event (bridge.ts, `upstream_stall_timeout`). Any window inside runTurn that awaits without
+  // emitting is therefore a turn the user loses, and the waits that run before a session exists
+  // — the structured compaction handoff and the owner-retirement wait — used to be exactly that.
+  function livenessRequest(turnId: string, threadId: string, compaction: boolean): CodexParsedRequest {
+    const request = parsed();
+    if (compaction) request._compactionRequest = true;
+    request._rawBody = {
+      prompt_cache_key: threadId,
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }) },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Inspect the project" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+      ],
+    };
+    return request;
+  }
+
+  async function observeLiveness(
+    label: string,
+    observeMs: number,
+    drive: (
+      provider: CodexProviderConfig,
+      run: (request: CodexParsedRequest, emit: (event: AdapterEvent) => void, signal: AbortSignal) => Promise<void>,
+    ) => Promise<{ heartbeats: number[]; stop: () => void }>,
+  ): Promise<number[]> {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://liveness-${label}-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = () => new Promise<string>(() => {});
+    try {
+      const run = async (
+        request: CodexParsedRequest,
+        emit: (event: AdapterEvent) => void,
+        signal: AbortSignal,
+      ) => {
+        await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers(), abortSignal: signal }, emit);
+      };
+      const { heartbeats, stop } = await drive(provider, run);
+      await Bun.sleep(observeMs);
+      stop();
+      return heartbeats;
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  }
+
+  test("a turn blocked waiting for the previous owner to retire still proves it is alive", async () => {
+    const started = Date.now();
+    const heartbeats = await observeLiveness(
+      "owner-retirement",
+      CHATGPT_WEB_ADAPTER_HEARTBEAT_MS + 2_000,
+      async (_provider, run) => {
+        const holder = new AbortController();
+        const blocked = new AbortController();
+        const beats: number[] = [];
+        // The first turn owns the thread and never physically settles, so the second turn parks in
+        // getOrCreateAfterOwnerRetirement before any session — and before any per-session wiring —
+        // exists to speak for it.
+        void run(livenessRequest("turn_live_1", "thread_live", false), () => {}, holder.signal).catch(() => {});
+        await Bun.sleep(250);
+        void run(
+          livenessRequest("turn_live_2", "thread_live", false),
+          event => { if (event.type === "heartbeat") beats.push(Date.now() - started); },
+          blocked.signal,
+        ).catch(() => {});
+        return { heartbeats: beats, stop: () => { blocked.abort(); holder.abort(); } };
+      },
+    );
+
+    expect(heartbeats.length).toBeGreaterThanOrEqual(2);
+    // One on entry, before the wait is even reached, then the armed interval.
+    expect(heartbeats[0]).toBeLessThan(2_000);
+    expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
+  }, 40_000);
+
+  test("a compaction turn proves it is alive while the summarizing browser turn runs", async () => {
+    const started = Date.now();
+    const heartbeats = await observeLiveness(
+      "compaction",
+      CHATGPT_WEB_ADAPTER_HEARTBEAT_MS + 2_000,
+      async (_provider, run) => {
+        const abort = new AbortController();
+        const beats: number[] = [];
+        void run(
+          livenessRequest("turn_compact_1", "thread_compact", true),
+          event => { if (event.type === "heartbeat") beats.push(Date.now() - started); },
+          abort.signal,
+        ).catch(() => {});
+        return { heartbeats: beats, stop: () => abort.abort() };
+      },
+    );
+
+    expect(heartbeats.length).toBeGreaterThanOrEqual(2);
+    expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
+  }, 40_000);
 });
