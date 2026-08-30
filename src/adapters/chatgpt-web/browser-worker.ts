@@ -899,7 +899,17 @@ export class ChatGptCompletionTracker {
 
   constructor(private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS) {}
 
-  update(state: Parameters<typeof chatGptTurnIsComplete>[0], now = Date.now()): boolean {
+  update(
+    state: Parameters<typeof chatGptTurnIsComplete>[0] & { externalProgressLive?: boolean },
+    now = Date.now(),
+  ): boolean {
+    // An outstanding tool call proves the model has more to say, whatever the rendered message
+    // currently looks like. Completing here would return a truncated answer and retire the turn
+    // while its own tool calls were still in flight.
+    if (state.externalProgressLive) {
+      this.candidate = undefined;
+      return false;
+    }
     if (!chatGptTurnIsComplete(state)) {
       this.candidate = undefined;
       return false;
@@ -998,6 +1008,45 @@ export class ChatGptTurnDomHealthTracker {
 }
 
 export const CHATGPT_STOPPED_THINKING_GRACE_MS = 5_000;
+
+/**
+ * Consecutive internal observation faults tolerated before a turn is abandoned.
+ *
+ * A `TypeError` raised while reading the page is a defect in this worker, not evidence about
+ * ChatGPT. Tearing the turn down on one loses an accepted ChatGPT turn that cannot be resent, so
+ * the loop re-observes instead. The budget is consecutive: any successful observation resets it,
+ * and exhausting it still fails closed with the original fault as the cause.
+ */
+export const MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS = 8;
+
+/**
+ * How stale recorded MCP progress may be and still suppress DOM health checks.
+ *
+ * An outstanding tool call reports liveness regardless of age, so a call that never returns would
+ * otherwise hold a turn open forever — turns carry no deadline unless a caller supplies one. This
+ * bounds the silence since the last recorded activity rather than the turn's total duration, so a
+ * long turn that keeps calling tools is never penalised for taking a long time.
+ */
+export const CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS = 10 * 60_000;
+
+/** Tolerated clock difference between the recording daemon and the observing helper process. */
+export const CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS = 5_000;
+
+/** Proven MCP activity, additionally required to be recent enough to still be evidence. */
+export function chatGptExternalProgressSuppressesDomHealth(
+  snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
+  now: number,
+): boolean {
+  if (!chatGptExternalProgressIsLive(snapshot, now, CHATGPT_RESPONSE_DOM_GRACE_MS)) return false;
+  const lastProgressAt = snapshot?.lastProgressAt;
+  if (lastProgressAt === undefined) return false;
+  const age = now - lastProgressAt;
+  // A timestamp from the future would keep `age` below the ceiling forever. Recorded activity can
+  // only precede the observation, so anything meaningfully ahead of now is not evidence at all.
+  return age >= -CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS
+    && age < CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
+}
+
 
 export class ChatGptStoppedThinkingTracker {
   private visibleSince?: number;
@@ -2540,6 +2589,7 @@ export class ChatGptBrowserWorker {
         currentText: snapshot.visibleText,
         currentHtml: snapshot.fullHtml,
         completionActionVisible: snapshot.completionActionVisible,
+        externalProgressLive,
       })) {
         const actual = snapshot.visibleText.trim();
         if (actual !== stage.acknowledgement) {
@@ -3657,6 +3707,14 @@ export class ChatGptBrowserWorker {
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       for (;;) {
+        // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
+        // a defect in the caller must not be retried as though the page could not be read.
+        if (Date.now() - lastHeartbeat >= 10_000) {
+          turn.onHeartbeat?.();
+          lastHeartbeat = Date.now();
+        }
+       try {
+        observedThisIteration = false;
         if (page.isClosed()) {
           throw chatGptBrowserTabClosedError();
         }
@@ -3668,11 +3726,6 @@ export class ChatGptBrowserWorker {
         if (deadline !== undefined && Date.now() >= deadline) {
           throw new Error("ChatGPT web turn timed out");
         }
-        if (Date.now() - lastHeartbeat >= 10_000) {
-          turn.onHeartbeat?.();
-          lastHeartbeat = Date.now();
-        }
-
         await throwIfChatGptSessionFailureAlert(page);
         await throwIfChatGptMessageTooLongAlert(page);
         await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
@@ -3780,6 +3833,7 @@ export class ChatGptBrowserWorker {
             currentText: snapshot.visibleText,
             currentHtml: snapshot.fullHtml,
             completionActionVisible: snapshot.completionActionVisible,
+            externalProgressLive,
           })) {
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
@@ -3834,6 +3888,26 @@ export class ChatGptBrowserWorker {
           if (domError) throw new Error(domError);
         }
         await pollSleep();
+       } catch (error) {
+        // Only a defect in this worker is retried here. Every deliberate signal — adapter errors,
+        // aborts, closed tabs, DOM-health verdicts — still fails the turn immediately.
+        if (!(error instanceof TypeError)) throw error;
+        internalObservationFaults += 1;
+        if (internalObservationFaults > MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS) {
+          throw new Error(
+            `ChatGPT browser observation failed ${internalObservationFaults} times in a row: ${error.message}`,
+            { cause: error },
+          );
+        }
+        console.warn(
+          `[chatgpt-web] browser turn ${turn.traceId} tolerated internal observation fault`
+          + ` ${internalObservationFaults}/${MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS}: ${error.message}`,
+        );
+        await diagnostics.capture(page, "internal-observation-fault");
+        responseDomCache.key = undefined;
+        responseDomCache.snapshot = undefined;
+        await pollSleep();
+       }
       }
 
       if (this.context && this.config.browserHost === "managed-chrome") {
