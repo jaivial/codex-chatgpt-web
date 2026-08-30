@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { chromium, type BrowserContextOptions, type Page } from "playwright-core";
+import { chromium } from "patchright";
+import type { BrowserContextOptions, Page } from "patchright-core";
 import { runCommand } from "./process";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
@@ -95,6 +96,16 @@ export function storedBrowserLoginCapabilities(
   }
 }
 
+export function parseProxyUrl(raw: string): { server: string; username?: string; password?: string } {
+  const url = new URL(raw);
+  const server = `${url.protocol.replace(":", "")}://${url.hostname}:${url.port || (url.protocol === "https:" ? "443" : "80")}`;
+  return {
+    server,
+    ...(url.username ? { username: decodeURIComponent(url.username) } : {}),
+    ...(url.password ? { password: decodeURIComponent(url.password) } : {}),
+  };
+}
+
 export type LoginHeadlessMode = "auto" | "force" | "off";
 
 export interface LoginToChatGptOptions {
@@ -105,6 +116,7 @@ export interface LoginToChatGptOptions {
   password?: string;
   mfaCodePrompt?: () => Promise<string>;
   sessionCookie?: string;
+  proxy?: { server: string; username?: string; password?: string };
 }
 
 const AUTH_LOGIN_URL = "https://auth.openai.com/log-in";
@@ -117,19 +129,32 @@ async function attemptCredentialLogin(
   headless: boolean,
   timeoutMs: number,
   mfaCodePrompt?: () => Promise<string>,
+  proxy?: { server: string; username?: string; password?: string },
 ): Promise<BrowserLoginResult> {
   const context = await chromium.launchPersistentContext(profileDir, {
     executablePath: config.chromeExecutablePath,
     headless,
     ignoreDefaultArgs: CHROME_IGNORE_DEFAULT_ARGS,
     args: CHROME_LAUNCH_ARGS,
+    ...(proxy ? { proxy } : {}),
   });
   let page: Page | undefined;
   try {
     page = context.pages()[0] ?? await context.newPage();
     await page.goto(AUTH_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    // Turnstile interstitial: click the widget container so managed/checkbox mode resolves.
+    for (let turnstileAttempt = 0; turnstileAttempt < 8; turnstileAttempt += 1) {
+      const emailReady = await page.locator('input[name="email"], input#email-input, input[type="email"]').first()
+        .isVisible({ timeout: 5_000 }).catch(() => false);
+      if (emailReady) break;
+      const widget = page.locator('[class*="cf-turnstile"], [data-sitekey], iframe[title*="Cloudflare" i]').first();
+      if (await widget.isVisible().catch(() => false)) {
+        await widget.click({ timeout: 5_000 }).catch(() => {});
+      }
+      await page.waitForTimeout(5_000);
+    }
     const emailInput = page.locator('input[name="email"], input#email-input, input[type="email"]').first();
-    await emailInput.waitFor({ state: "visible", timeout: 30_000 });
+    await emailInput.waitFor({ state: "visible", timeout: 60_000 });
     await emailInput.fill(email);
     await page.getByRole("button", { name: /continue/i }).first().click();
     const passwordInput = page.locator('input[type="password"]').first();
@@ -156,14 +181,26 @@ async function attemptCredentialLogin(
       await composer.waitFor({ state: "visible", timeout: timeoutMs });
     } catch {
       if (await headlessLoginBlocked(page)) {
-        throw new Error("CREDENTIAL_LOGIN_BLOCKED: ChatGPT served a bot challenge during credential login");
+        const d = await page.evaluate(() => ({
+          u: location.href.slice(0, 140),
+          t: document.title.slice(0, 80),
+          cf: document.querySelectorAll("iframe[src*='challenges.cloudflare.com']").length,
+          n: document.body.innerText.length,
+        })).catch(() => "diagfail");
+        throw new Error(`CREDENTIAL_LOGIN_BLOCKED: ${JSON.stringify(d)}`);
       }
       throw new Error("Credential login finished but no ChatGPT composer appeared (check email/password or complete any verification manually)");
     }
     return await finalizeLogin(config, context, page, headless);
   } catch (error) {
     if (page && headless && await headlessLoginBlocked(page).catch(() => false)) {
-      throw new Error("CREDENTIAL_LOGIN_BLOCKED: bot challenge during credential login");
+      const d = await page.evaluate(() => ({
+        u: location.href.slice(0, 140),
+        t: document.title.slice(0, 80),
+        cf: document.querySelectorAll("iframe[src*='challenges.cloudflare.com']").length,
+        n: document.body.innerText.length,
+      })).catch(() => "diagfail");
+      throw new Error(`CREDENTIAL_LOGIN_BLOCKED: ${JSON.stringify(d)}`);
     }
     throw error;
   } finally {
@@ -181,8 +218,10 @@ function composerLocator(page: Page) {
 }
 
 async function headlessLoginBlocked(page: Page): Promise<boolean> {
-  const content = await page.content().catch(() => "");
-  return /challenge-platform|just a moment|verify you are human|cf-please-wait/i.test(content);
+  // Only an interactive Turnstile widget counts; chatgpt.com always ships the
+  // challenge-platform script tag, so text matching false-positives.
+  const turnstile = page.locator('iframe[title*="Cloudflare" i], iframe[src*="challenges.cloudflare.com"]').first();
+  return await turnstile.isVisible().catch(() => false);
 }
 
 async function withEphemeralXvfb<T>(fn: (display: string) => Promise<T>): Promise<T> {
@@ -311,6 +350,7 @@ async function attemptPersistentLogin(
   profileDir: string,
   headless: boolean,
   timeoutMs: number,
+  proxy?: { server: string; username?: string; password?: string },
 ): Promise<BrowserLoginResult> {
   const context = await chromium.launchPersistentContext(profileDir, {
     executablePath: config.chromeExecutablePath,
@@ -374,7 +414,7 @@ export async function loginToChatGpt(
     if (options.email === undefined || options.password === undefined || !options.email || !options.password) {
       throw new Error("Credential login requires both --email and a password (--password-file or CODEX_CHATGPT_WEB_PASSWORD)");
     }
-    const tryCreds = (headless: boolean) => attemptCredentialLogin(config, profileDir, options.email!, options.password!, headless, timeoutMs, options.mfaCodePrompt);
+    const tryCreds = (headless: boolean) => attemptCredentialLogin(config, profileDir, options.email!, options.password!, headless, timeoutMs, options.mfaCodePrompt, options.proxy);
     try {
       return await tryCreds(true);
     } catch (error) {

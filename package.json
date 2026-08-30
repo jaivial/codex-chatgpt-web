@@ -55,6 +55,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "chromium-bidi": "12.1.0",
     "fflate": "^0.8.2",
+    "patchright": "^1.62.2",
     "playwright-core": "^1.62.0",
     "tiktoken": "1.0.22",
     "turndown": "7.2.0",

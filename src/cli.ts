@@ -5,7 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
-import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
+import { checkBrowserEngine, loginToChatGpt, parseProxyUrl } from "./browser-login";
 import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
 import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
 import {
@@ -73,6 +73,8 @@ Setup options:
                                fails hard. OTP arrives by e-mail (codex-style, no device).
   --session-token-file PATH   File with __Secure-next-auth.session-token value (or full
                                document.cookie / storageState JSON); or paste at prompt
+  --proxy URL                  Egress proxy for login browser (residential recommended on
+                               datacenter IPs): http://user:pass@host:port or socks5://...
   --email EMAIL                Credential login: drives auth.openai.com headlessly; omit both
                                --email/--password-file on a TTY for fully interactive prompts
   --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
@@ -161,6 +163,7 @@ async function loginCommand(args: string[]): Promise<void> {
   const passwordFile = takeOption(args, "--password-file");
   const noDevice = takeFlag(args, "--no-device");
   const sessionTokenFile = takeOption(args, "--session-token-file");
+  const proxyRaw = takeOption(args, "--proxy");
   assertNoArgs(args);
   if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
     throw new Error("--login-headless must be auto, force, or off");
@@ -202,6 +205,7 @@ async function loginCommand(args: string[]): Promise<void> {
     throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
   }
   const result = await loginToChatGpt(config, {
+    ...(proxyRaw ? { proxy: parseProxyUrl(proxyRaw) } : {}),
     ...(sessionCookie ? { sessionCookie } : {}),
     ...(effectiveLoginHeadless !== undefined ? { loginHeadless: effectiveLoginHeadless } : {}),
     ...(storageStateFile ? { storageStateFile } : {}),

@@ -1,4 +1,6 @@
-import type { Locator, Page } from "playwright-core";
+// ponytail: any-typed page/locator to stay compatible with playwright-core + patchright callers
+type Page = any;
+type Locator = any;
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
@@ -106,8 +108,8 @@ export async function detectChatGptAccountCapabilities(
       continue;
     }
     presenceObservations = 0;
-    const composerReady = await composers.count().then(count => count === 1).catch(() => false);
-    const formReady = await composerForm.count().then(count => count === 1).catch(() => false);
+    const composerReady = await composers.count().then((count: number) => count === 1).catch(() => false);
+    const formReady = await composerForm.count().then((count: number) => count === 1).catch(() => false);
     const documentReady = await page.evaluate(() => document.readyState === "complete").catch(() => false);
     if (composerReady && formReady && documentReady) {
       absenceSince ??= Date.now();

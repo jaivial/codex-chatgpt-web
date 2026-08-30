@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import { chromium } from "patchright";
+import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import {
   atomicWriteFile,
   CHATGPT_CONNECTOR_NAME,
@@ -1483,7 +1484,7 @@ export class ChatGptBrowserWorker {
     this.browser = await chromium.launch({
       executablePath: this.config.chromeExecutablePath,
       headless: !this.config.headed,
-    });
+    }) as unknown as Browser;
     this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
     this.page = await this.context.newPage();
     return this.page;
@@ -1501,7 +1502,7 @@ export class ChatGptBrowserWorker {
       const browser = await chromium.launch({
         executablePath: this.config.chromeExecutablePath,
         headless: !this.config.headed,
-      });
+      }) as unknown as Browser;
       const context = await browser.newContext({ storageState: this.config.storageStatePath });
       this.browser = browser;
       this.context = context;
