@@ -69,6 +69,8 @@ Setup options:
   --login                      Refresh the stored ChatGPT login even if one exists
   --login-headless MODE        auto (default) | force | off for the login command; auto falls back to ephemeral Xvfb
   --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
+  --no-device                  Pure headless login: never opens windows/Xvfb; bot challenge
+                               fails hard. OTP arrives by e-mail (codex-style, no device).
   --email EMAIL                Credential login: drives auth.openai.com headlessly; omit both
                                --email/--password-file on a TTY for fully interactive prompts
   --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
@@ -155,10 +157,13 @@ async function loginCommand(args: string[]): Promise<void> {
   const storageStateFile = takeOption(args, "--storage-state-file");
   let email = takeOption(args, "--email");
   const passwordFile = takeOption(args, "--password-file");
+  const noDevice = takeFlag(args, "--no-device");
   assertNoArgs(args);
   if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
     throw new Error("--login-headless must be auto, force, or off");
   }
+  // --no-device: pure headless, never spawn windows/Xvfb; bot challenge = hard error.
+  const effectiveLoginHeadless = noDevice || loginHeadless === "force" ? "force" as const : loginHeadless;
   let password: string | undefined;
   if (passwordFile) {
     password = readFileSync(passwordFile, "utf8").replace(/\r?\n$/, "");
@@ -181,7 +186,7 @@ async function loginCommand(args: string[]): Promise<void> {
     throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
   }
   const result = await loginToChatGpt(config, {
-    ...(loginHeadless !== undefined ? { loginHeadless: loginHeadless as "auto" | "force" | "off" } : {}),
+    ...(effectiveLoginHeadless !== undefined ? { loginHeadless: effectiveLoginHeadless } : {}),
     ...(storageStateFile ? { storageStateFile } : {}),
     ...(email && password ? { email, password } : {}),
     mfaCodePrompt: email && password && stdin.isTTY && stdout.isTTY
