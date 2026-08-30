@@ -1927,13 +1927,13 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("if (options.knownKey === observerKey) return { key: observerKey }");
   expect(workerSource).toContain("new MutationObserver(() =>");
   expect(workerSource).toContain('const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(".markdown")]');
-  expect(workerSource).toContain("const commentaryRoots = allMarkdownRoots.filter");
+  expect(workerSource).toContain("const selectChatGptAnswerRoots = (");
   expect(workerSource).toContain('candidate.closest("[data-streaming-response-status]") !== null');
   expect(workerSource).toContain("const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>");
-  expect(workerSource).toContain("const firstStreamingStatusContainer = streamingStatusContainers[0]");
-  expect(workerSource).toContain("candidate.compareDocumentPosition(firstStreamingStatusContainer)");
-  expect(workerSource).toContain("const renderedRoots = allMarkdownRoots.filter");
-  expect(workerSource).toContain("!commentaryRoots.includes(candidate)");
+  expect(workerSource).toContain("const firstStatusContainer = statusContainers[0]");
+  expect(workerSource).toContain("candidate.compareDocumentPosition(firstStatusContainer)");
+  expect(workerSource).toContain("const renderedRoots = classified.answerRoots;");
+  expect(workerSource).toContain("markdownRoots.filter(candidate => !commentary.includes(candidate))");
   expect(workerSource).toContain('fullHtml: renderedRoots.map(candidate => candidate.innerHTML).join("")');
   expect(workerSource).toContain("const flattenedMarkdownSegments:");
   expect(workerSource).toContain("Root boundaries and visible indices therefore are not identity");
@@ -2286,3 +2286,159 @@ test("answer Markdown is not reclassified as commentary when a later tool call o
     /streamingStatusContainers\.some\(status => \(\s*Boolean\(candidate\.compareDocumentPosition\(status\)/,
   );
 });
+
+test("an accepted turn survives internal observation faults instead of being torn down", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+
+  // A TypeError while reading the page is a defect in this worker, not evidence about ChatGPT.
+  // Failing the turn on one loses an accepted ChatGPT turn that is never resent.
+  expect(MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS).toBeGreaterThan(1);
+  expect(worker).toContain("if (!(error instanceof TypeError) || observedThisIteration) throw error;");
+  expect(worker).toContain("internalObservationFaults = 0;");
+  expect(worker).toMatch(/internalObservationFaults > MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS/);
+
+  // Liveness may postpone a verdict but never waive it, so a tool call that never returns cannot
+  // hold an undeadlined turn open forever.
+  expect(CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS).toBeGreaterThan(CHATGPT_RESPONSE_DOM_GRACE_MS);
+
+  // Chain-of-thought containment is commentary regardless of document position.
+  expect(worker).toContain('candidate.closest(\'[data-testid^="cot-v5"]\') !== null');
+});
+
+test("stale MCP progress stops suppressing DOM health without penalising long active turns", () => {
+  const outstanding = { revision: 2, lastToolBatchRevision: 2, activeToolCalls: 1, lastProgressAt: 1_000 };
+
+  // An outstanding call reports liveness regardless of age, so age is bounded separately: a tool
+  // that never returns must not hold a turn open forever, since turns carry no deadline by default.
+  expect(chatGptExternalProgressSuppressesDomHealth(outstanding, 1_000)).toBeTrue();
+  expect(chatGptExternalProgressSuppressesDomHealth(
+    outstanding,
+    1_000 + CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS - 1,
+  )).toBeTrue();
+  expect(chatGptExternalProgressSuppressesDomHealth(
+    outstanding,
+    1_000 + CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS,
+  )).toBeFalse();
+
+  // A turn that keeps calling tools stays suppressed no matter how long it has been running, so
+  // the bound is silence since the last activity rather than total turn duration.
+  const hoursIn = 4 * 60 * 60_000;
+  expect(chatGptExternalProgressSuppressesDomHealth(
+    { ...outstanding, lastProgressAt: hoursIn },
+    hoursIn + 1_000,
+  )).toBeTrue();
+
+  // No recorded activity is never evidence.
+  expect(chatGptExternalProgressSuppressesDomHealth(undefined, 1_000)).toBeFalse();
+  expect(chatGptExternalProgressSuppressesDomHealth(
+    { revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 },
+    1_000,
+  )).toBeFalse();
+});
+
+test("the daemon prefers the browser helper that shipped beside its own entrypoint", () => {
+  const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
+  const helper = readFileSync("src/adapters/chatgpt-web/browser-helper-main.ts", "utf8");
+
+  // The launcher advertises the helper inside its signed application bundle while the daemon runs
+  // from a versioned runtime directory, so the two update independently. A daemon that spoke a
+  // newer protocol to an older helper had its frame routed to the run handler, which dereferenced
+  // a turn the frame never carried and destroyed the turn with an opaque TypeError.
+  expect(client).toContain("bundledHelperScript()");
+  expect(client).toMatch(/browserHelperScriptPath \?\? this\.bundledHelperScript\(\) \?\? descriptor\.helper\.script/);
+
+  // Belt and braces: negotiate the frame, and never treat an unrecognised frame as a run.
+  expect(client).toContain('this.helperFeatures.has("progress")');
+  expect(helper).toContain('features: ["progress"]');
+  expect(helper).toMatch(/message\.type === "run"/);
+  expect(helper).toContain("Browser helper received an unsupported message type");
+
+  // A malformed liveness hint must not destroy an accepted turn that can never be resent.
+  expect(helper).toContain("discarded an invalid MCP progress frame");
+});
+
+
+test("proven progress forgets a Stopped thinking window rather than merely ignoring it", () => {
+  const tracker = new ChatGptStoppedThinkingTracker(5_000);
+
+  // The label appears while a tool call is outstanding. Suppressing only the verdict let this
+  // window keep accruing, so the first observation after the tool result cancelled the turn.
+  expect(tracker.update(true, 1_000)).toBeFalse();
+  expect(tracker.update(true, 3_000)).toBeFalse();
+  tracker.clear();
+
+  // Progress has ended and the window starts again from here, not from the original sighting.
+  expect(tracker.update(true, 6_500)).toBeFalse();
+  expect(tracker.update(true, 11_499)).toBeFalse();
+  expect(tracker.update(true, 11_500)).toBeTrue();
+});
+
+test("the shipped commentary classifier separates answer Markdown from reasoning in a real DOM", () => {
+  // The classifier runs inside page.evaluate, so it cannot be imported. Extract and execute the
+  // exact shipped source instead of a copy, which is what lets this test detect a regression in
+  // the code that actually runs rather than in a restatement of it.
+  // domino ships without module typings; it is already present as a turndown dependency and is
+  // the only DOM implementation available to this suite.
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => {
+      body: { querySelectorAll: (selector: string) => ArrayLike<HTMLElement> };
+    };
+  };
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const source = worker.split("// CHATGPT_COMMENTARY_CLASSIFIER_BEGIN")[1]?.split("// CHATGPT_COMMENTARY_CLASSIFIER_END")[0];
+  if (!source) throw new Error("commentary classifier sentinels are missing from browser-worker.ts");
+  const javascript = source
+    .replace(/:\s*HTMLElement\[\]/g, "")
+    .replace(/\):\s*\{[^}]*\}\s*=>/, ") =>");
+  const selectChatGptAnswerRoots = new Function(
+    `${javascript}; return selectChatGptAnswerRoots;`,
+  )() as (roots: unknown[], statuses: unknown[]) => { answerRoots: Array<{ textContent: string }> };
+
+  const answerFor = (html: string): string => {
+    const document = createDocument(`<body>${html}</body>`);
+    // domino's NodeList is array-like rather than iterable.
+    const roots = Array.from(document.body.querySelectorAll(".markdown"))
+      .filter(candidate => !candidate.parentElement?.closest(".markdown"));
+    const statuses = Array.from(document.body.querySelectorAll("[data-streaming-response-status]"));
+    return selectChatGptAnswerRoots(roots, statuses).answerRoots
+      .map(root => (root.textContent ?? "").trim())
+      .filter(Boolean)
+      .join(" | ");
+  };
+
+  // Commentary that precedes the live status, and commentary nested inside one, stay excluded.
+  expect(answerFor(
+    '<div class="markdown">COMMENTARY</div>'
+    + '<div data-streaming-response-status>live</div>'
+    + '<div class="markdown">ANSWER</div>',
+  )).toBe("ANSWER");
+  expect(answerFor(
+    '<div data-streaming-response-status><div class="markdown">NESTED</div></div>'
+    + '<div class="markdown">ANSWER</div>',
+  )).toBe("ANSWER");
+
+  // Reasoning rendered inside a chain-of-thought component is commentary wherever it sits.
+  expect(answerFor(
+    '<div data-streaming-response-status>s1</div>'
+    + '<div data-testid="cot-v5-block"><div class="markdown">THINKING</div></div>'
+    + '<div class="markdown">ANSWER</div>',
+  )).toBe("ANSWER");
+
+  // The regressions this rule exists for: a second tool call opening a status container below
+  // already-emitted answer text used to blank the visible text and drop answer chunks entirely.
+  expect(answerFor(
+    '<div data-streaming-response-status>s1</div>'
+    + '<div class="markdown">ANSWER</div>'
+    + '<div data-streaming-response-status>s2</div>',
+  )).toBe("ANSWER");
+  expect(answerFor(
+    '<div data-streaming-response-status>s1</div>'
+    + '<div class="markdown">PART ONE</div>'
+    + '<div data-streaming-response-status>s2</div>'
+    + '<div class="markdown">PART TWO</div>',
+  )).toBe("PART ONE | PART TWO");
+
+  // A turn with no status container at all is entirely answer.
+  expect(answerFor('<div class="markdown">ONLY ANSWER</div>')).toBe("ONLY ANSWER");
+});
+
