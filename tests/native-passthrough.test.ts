@@ -223,3 +223,95 @@ test("forwards native model discovery as GET and preserves the client version qu
   expect(upstreamRequest!.method).toBe("GET");
   expect(upstreamRequest!.headers.get("if-none-match")).toBeNull();
 });
+
+test("repairs a missing models client_version from an exact first-party Codex user agent", async () => {
+  const request = new Request("http://127.0.0.1:17841/v1/models", {
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "user-agent": "codex_chatgpt_desktop/0.151.0-alpha.7.2 (Mac OS 15.6; arm64) Codex",
+    },
+  });
+  let upstreamRequest: Request | undefined;
+  await forwardNativeCodexRequest(request, "models", async input => {
+    upstreamRequest = input;
+    return Response.json({ models: [] });
+  });
+  expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/models?client_version=0.151.0");
+});
+
+test("does not invent a models client version from an unrelated user agent", async () => {
+  const request = new Request("http://127.0.0.1:17841/v1/models", {
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "user-agent": "Mozilla/5.0 Codex/999.999.999",
+    },
+  });
+  let upstreamRequest: Request | undefined;
+  await forwardNativeCodexRequest(request, "models", async input => {
+    upstreamRequest = input;
+    return Response.json({ models: [] });
+  });
+  expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/models");
+});
+
+/** A reset after `data: [DONE]` is a completed stream, while a reset before it is a truncation. */
+function nativeRequest(): Request {
+  return new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { authorization: "Bearer codex-oauth-token", "content-type": "application/json" },
+    body: '{"model":"gpt-5.6-sol","stream":true}',
+  });
+}
+
+function resettingEventStream(prefix: string[]): Response {
+  const encoder = new TextEncoder();
+  let sent = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent < prefix.length) {
+        controller.enqueue(encoder.encode(prefix[sent]!));
+        sent += 1;
+        return;
+      }
+      const reset = new Error("The socket connection was closed unexpectedly");
+      (reset as Error & { code?: string }).code = "ECONNRESET";
+      controller.error(reset);
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+test("an upstream reset after the turn completed closes the client stream normally", async () => {
+  const response = await forwardNativeCodexRequest(
+    nativeRequest(),
+    "responses",
+    async () => resettingEventStream([
+      'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+      "data: [DONE]\n\n",
+    ]),
+  );
+
+  const body = await response.text();
+  expect(body).toContain("response.completed");
+  expect(body).toEndWith("data: [DONE]\n\n");
+});
+
+test("an upstream reset that truncated the turn is still surfaced as a failure", async () => {
+  const response = await forwardNativeCodexRequest(
+    nativeRequest(),
+    "responses",
+    async () => resettingEventStream(['event: response.output_text.delta\ndata: {"delta":"half"}\n\n']),
+  );
+
+  await expect(response.text()).rejects.toThrow();
+});
+
+test("a non-event-stream body is passed through untouched", async () => {
+  const response = await forwardNativeCodexRequest(
+    nativeRequest(),
+    "responses",
+    async () => new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+  );
+
+  expect(await response.text()).toBe('{"ok":true}');
+});
