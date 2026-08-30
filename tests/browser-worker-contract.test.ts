@@ -271,17 +271,17 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
     "const previousConnection = turnConnection;",
     rebindDefinition,
   );
-  const failClosedDisconnect = runBrowserTurn.indexOf(
-    "connectAfterClosingBrowserConnection(",
+  const detachOldConnection = runBrowserTurn.indexOf(
+    "turnConnection = undefined;",
     previousConnection,
   );
-  const detachClosedConnection = runBrowserTurn.indexOf(
-    "turnConnection = undefined;",
-    failClosedDisconnect,
+  const disconnectOldConnection = runBrowserTurn.indexOf(
+    "await previousConnection.close()",
+    detachOldConnection,
   );
   const reconnectStage = runBrowserTurn.indexOf(
-    "return this.runStage(",
-    detachClosedConnection,
+    "const connection = await this.runStage(",
+    disconnectOldConnection,
   );
   const reconnectTransport = runBrowserTurn.indexOf(
     "const rebound = await connectLauncherBrowserHost(",
@@ -292,9 +292,9 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   expect(duplicateSend).toBe(-1);
   expect(rebindDefinition).toBeGreaterThan(-1);
   expect(previousConnection).toBeGreaterThan(rebindDefinition);
-  expect(failClosedDisconnect).toBeGreaterThan(previousConnection);
-  expect(detachClosedConnection).toBeGreaterThan(failClosedDisconnect);
-  expect(reconnectStage).toBeGreaterThan(detachClosedConnection);
+  expect(detachOldConnection).toBeGreaterThan(previousConnection);
+  expect(disconnectOldConnection).toBeGreaterThan(detachOldConnection);
+  expect(reconnectStage).toBeGreaterThan(disconnectOldConnection);
   expect(reconnectTransport).toBeGreaterThan(reconnectStage);
   expect(runBrowserTurn).not.toContain(
     "previous browser observation connection did not close after rebind",
