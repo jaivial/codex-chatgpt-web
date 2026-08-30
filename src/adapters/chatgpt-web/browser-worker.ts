@@ -1090,32 +1090,12 @@ export const CHATGPT_STOPPED_THINKING_GRACE_MS = 5_000;
 export const MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS = 8;
 
 /**
- * How stale recorded MCP progress may be and still suppress DOM health checks.
+ * Absolute ceiling on how long proven MCP progress may suppress DOM health checks.
  *
- * An outstanding tool call reports liveness regardless of age, so a call that never returns would
- * otherwise hold a turn open forever — turns carry no deadline unless a caller supplies one. This
- * bounds the silence since the last recorded activity rather than the turn's total duration, so a
- * long turn that keeps calling tools is never penalised for taking a long time.
+ * Liveness is reported while a tool call is outstanding, so a tool that never returns would
+ * otherwise hold a turn open forever whenever the caller supplied no turn deadline.
  */
-export const CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS = 10 * 60_000;
-
-/** Tolerated clock difference between the recording daemon and the observing helper process. */
-export const CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS = 5_000;
-
-/** Proven MCP activity, additionally required to be recent enough to still be evidence. */
-export function chatGptExternalProgressSuppressesDomHealth(
-  snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
-  now: number,
-): boolean {
-  if (!chatGptExternalProgressIsLive(snapshot, now, CHATGPT_RESPONSE_DOM_GRACE_MS)) return false;
-  const lastProgressAt = snapshot?.lastProgressAt;
-  if (lastProgressAt === undefined) return false;
-  const age = now - lastProgressAt;
-  // A timestamp from the future would keep `age` below the ceiling forever. Recorded activity can
-  // only precede the observation, so anything meaningfully ahead of now is not evidence at all.
-  return age >= -CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS
-    && age < CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
-}
+export const CHATGPT_EXTERNAL_PROGRESS_SUPPRESSION_CEILING_MS = 30 * 60_000;
 
 export class ChatGptStoppedThinkingTracker {
   private visibleSince?: number;
@@ -2940,39 +2920,25 @@ export class ChatGptBrowserWorker {
         .filter(renderedInDom);
       const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
         .filter(renderedInDom);
-      // CHATGPT_COMMENTARY_CLASSIFIER_BEGIN
-      // Self-contained so the test suite can execute this exact source against a synthetic DOM;
-      // it must not close over anything from the surrounding evaluate scope.
-      const selectChatGptAnswerRoots = (
-        markdownRoots: HTMLElement[],
-        statusContainers: HTMLElement[],
-      ): { commentaryRoots: HTMLElement[]; answerRoots: HTMLElement[] } => {
-        const firstStatusContainer = statusContainers[0];
-        const commentary = markdownRoots.filter(candidate => (
-          candidate.closest("[data-streaming-response-status]") !== null
-          // Chain-of-thought components carry reasoning, never the final answer, so containment is
-          // a position-independent commentary signal. Position alone cannot separate "commentary
-          // between two status containers" from "answer between two tool calls".
-          || candidate.closest('[data-testid^="cot-v5"]') !== null
-          // Only Markdown that precedes the FIRST status container is prior commentary. Keying
-          // this on "some status follows me" silently reclassified answer text as commentary as
-          // soon as a second tool call opened another status container below it, which both zeroed
-          // the visible text and dropped every answer chunk emitted between tool calls.
-          || (firstStatusContainer !== undefined && Boolean(
-            // 4 is Node.DOCUMENT_POSITION_FOLLOWING, inlined to keep this function standalone.
-            candidate.compareDocumentPosition(firstStatusContainer) & 4,
-          ))
-        ));
-        return {
-          commentaryRoots: commentary,
-          answerRoots: markdownRoots.filter(candidate => !commentary.includes(candidate)),
-        };
-      };
-      // CHATGPT_COMMENTARY_CLASSIFIER_END
-      const classified = selectChatGptAnswerRoots(allMarkdownRoots, streamingStatusContainers);
-      const commentaryRoots = classified.commentaryRoots;
-      const renderedRoots = classified.answerRoots;
-
+      const firstStreamingStatusContainer = streamingStatusContainers[0];
+      const commentaryRoots = allMarkdownRoots.filter(candidate => (
+        candidate.closest("[data-streaming-response-status]") !== null
+        // Chain-of-thought components carry reasoning, never the final answer, so containment is a
+        // positional-independent commentary signal. Position alone cannot separate "commentary
+        // between two status containers" from "answer between two tool calls".
+        || candidate.closest('[data-testid^="cot-v5"]') !== null
+        // Only Markdown that precedes the FIRST status container is prior commentary. Keying this
+        // on "some status follows me" silently reclassified answer text as commentary as soon as a
+        // second tool call opened another status container below it, which both zeroed the visible
+        // text and dropped every answer chunk emitted between tool calls.
+        || (firstStreamingStatusContainer !== undefined && Boolean(
+          candidate.compareDocumentPosition(firstStreamingStatusContainer)
+          & Node.DOCUMENT_POSITION_FOLLOWING,
+        ))
+      ));
+      const renderedRoots = allMarkdownRoots.filter(candidate => (
+        !commentaryRoots.includes(candidate)
+      ));
       // ChatGPT may merge adjacent `.markdown` roots or virtualize an old prefix while a streamed
       // answer is finalized. Root boundaries and visible indices therefore are not identity:
       // flatten semantic blocks and preserve ChatGPT's source ranges across that reparenting.
@@ -3809,16 +3775,8 @@ export class ChatGptBrowserWorker {
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       let internalObservationFaults = 0;
-      let observedThisIteration = false;
       for (;;) {
-        // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
-        // a defect in the caller must not be retried as though the page could not be read.
-        if (Date.now() - lastHeartbeat >= 10_000) {
-          turn.onHeartbeat?.();
-          lastHeartbeat = Date.now();
-        }
        try {
-        observedThisIteration = false;
         if (page.isClosed()) {
           throw chatGptBrowserTabClosedError();
         }
@@ -3886,16 +3844,14 @@ export class ChatGptBrowserWorker {
           }
         }
         if (snapshot.responsePresent) consecutiveObservationRebinds = 0;
-        // The page was read successfully, so the fault budget is genuinely consecutive even when
-        // this iteration goes on to `continue` for a rebind, confirmation, or liveness pause.
-        internalObservationFaults = 0;
-        observedThisIteration = true;
-        // Liveness may postpone a verdict, never waive it: once activity goes stale the DOM alone
-        // decides, so a tool call that never returns cannot hold an undeadlined turn open forever.
-        const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
-          turn.externalProgress?.snapshot(),
-          Date.now(),
-        );
+        // Liveness may postpone a verdict, never waive it: past the ceiling the DOM alone decides,
+        // so a tool call that never returns cannot hold an undeadlined turn open indefinitely.
+        const externalProgressLive = Date.now() - sentAt < CHATGPT_EXTERNAL_PROGRESS_SUPPRESSION_CEILING_MS
+          && chatGptExternalProgressIsLive(
+            turn.externalProgress?.snapshot(),
+            Date.now(),
+            CHATGPT_RESPONSE_DOM_GRACE_MS,
+          );
         // A stale "Stopped thinking" label is not terminal while the model is still driving tool
         // calls, and the window must be forgotten rather than merely ignored.
         if (externalProgressLive) stoppedThinkingTracker.clear();
@@ -3998,14 +3954,12 @@ export class ChatGptBrowserWorker {
           });
           if (domError) throw new Error(domError);
         }
-        await pollSleep();
+        internalObservationFaults = 0;
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
        } catch (error) {
         // Only a defect in this worker is retried here. Every deliberate signal — adapter errors,
         // aborts, closed tabs, DOM-health verdicts — still fails the turn immediately.
-        // Retry only faults raised while reading the page. Once observation succeeded, a
-        // TypeError belongs to a consumer - Markdown buffering, text/trace callbacks, checkpoint
-        // capture - and retrying it would rerun an iteration whose side effects already happened.
-        if (!(error instanceof TypeError) || observedThisIteration) throw error;
+        if (!(error instanceof TypeError)) throw error;
         internalObservationFaults += 1;
         if (internalObservationFaults > MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS) {
           throw new Error(
@@ -4020,7 +3974,7 @@ export class ChatGptBrowserWorker {
         await diagnostics.capture(page, "internal-observation-fault");
         responseDomCache.key = undefined;
         responseDomCache.snapshot = undefined;
-        await pollSleep();
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
        }
       }
 
