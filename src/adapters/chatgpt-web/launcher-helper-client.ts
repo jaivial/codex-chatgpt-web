@@ -269,7 +269,7 @@ export class LauncherBrowserHelperClient {
     const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
     const child = spawn(
       descriptor.helper.executable,
-      [this.config.browserHelperScriptPath ?? descriptor.helper.script],
+      [this.config.browserHelperScriptPath ?? this.bundledHelperScript() ?? descriptor.helper.script],
       {
         env: {
           ...process.env,
