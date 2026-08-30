@@ -103,6 +103,7 @@ export interface LoginToChatGptOptions {
   storageStateFile?: string;
   email?: string;
   password?: string;
+  mfaCodePrompt?: () => Promise<string>;
 }
 
 const AUTH_LOGIN_URL = "https://auth.openai.com/log-in";
@@ -114,6 +115,7 @@ async function attemptCredentialLogin(
   password: string,
   headless: boolean,
   timeoutMs: number,
+  mfaCodePrompt?: () => Promise<string>,
 ): Promise<BrowserLoginResult> {
   const context = await chromium.launchPersistentContext(profileDir, {
     executablePath: config.chromeExecutablePath,
@@ -133,6 +135,19 @@ async function attemptCredentialLogin(
     await passwordInput.waitFor({ state: "visible", timeout: 30_000 });
     await passwordInput.fill(password);
     await page.getByRole("button", { name: /continue|log in/i }).first().click();
+    // ChatGPT may require an e-mail OTP after the password. Surface an interactive
+    // prompt (CLI) so the flow stays terminal-driven; skip when no prompt is wired.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const otpInput = page.locator('input[autocomplete="one-time-code"], input[inputmode="numeric"][name*="code" i], input[aria-label*="code" i]').first();
+      const otpVisible = await otpInput.isVisible().catch(() => false);
+      if (!otpVisible || !mfaCodePrompt) break;
+      const code = (await mfaCodePrompt()).trim();
+      if (!code) throw new Error("ChatGPT requested an e-mail verification code but no code was provided");
+      await otpInput.fill(code);
+      const continueButton = page.getByRole("button", { name: /continue|verify/i }).first();
+      if (await continueButton.isVisible().catch(() => false)) await continueButton.click();
+      await page.waitForTimeout(1_500);
+    }
     await page.waitForURL(/chatgpt\.com/, { timeout: 120_000 });
     await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
     const composer = composerLocator(page);
@@ -303,7 +318,7 @@ export async function loginToChatGpt(
     if (options.email === undefined || options.password === undefined || !options.email || !options.password) {
       throw new Error("Credential login requires both --email and a password (--password-file or CODEX_CHATGPT_WEB_PASSWORD)");
     }
-    const tryCreds = (headless: boolean) => attemptCredentialLogin(config, profileDir, options.email!, options.password!, headless, timeoutMs);
+    const tryCreds = (headless: boolean) => attemptCredentialLogin(config, profileDir, options.email!, options.password!, headless, timeoutMs, options.mfaCodePrompt);
     try {
       return await tryCreds(true);
     } catch (error) {

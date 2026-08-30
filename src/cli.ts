@@ -69,7 +69,8 @@ Setup options:
   --login                      Refresh the stored ChatGPT login even if one exists
   --login-headless MODE        auto (default) | force | off for the login command; auto falls back to ephemeral Xvfb
   --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
-  --email EMAIL                Credential login: drives auth.openai.com headlessly
+  --email EMAIL                Credential login: drives auth.openai.com headlessly; omit both
+                               --email/--password-file on a TTY for fully interactive prompts
   --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
   --browser-host MODE          managed-chrome (headless default) | launcher for setup
   --headless                   Setup turns run headless (managed-chrome, no display)
@@ -152,7 +153,7 @@ function authorizeLauncherControl(operation: string): void {
 async function loginCommand(args: string[]): Promise<void> {
   const loginHeadless = takeOption(args, "--login-headless");
   const storageStateFile = takeOption(args, "--storage-state-file");
-  const email = takeOption(args, "--email");
+  let email = takeOption(args, "--email");
   const passwordFile = takeOption(args, "--password-file");
   assertNoArgs(args);
   if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
@@ -165,6 +166,12 @@ async function loginCommand(args: string[]): Promise<void> {
   } else if (email) {
     password = process.env.CODEX_CHATGPT_WEB_PASSWORD;
     if (!password) throw new Error("Credential login needs --password-file or CODEX_CHATGPT_WEB_PASSWORD");
+  } else if (!storageStateFile && stdin.isTTY && stdout.isTTY) {
+    // Interactive CLI login (codex-style): hidden password prompt, e-mail OTP prompt mid-flow.
+    email = await prompt("ChatGPT e-mail: ");
+    if (!email) throw new Error("An e-mail is required for interactive login");
+    password = await secretPrompt("ChatGPT password (hidden): ");
+    if (!password) throw new Error("A password is required for interactive login");
   }
   if ((email === undefined) !== (password === undefined)) {
     throw new Error("--email requires --password-file (or CODEX_CHATGPT_WEB_PASSWORD); they are used together");
@@ -177,6 +184,9 @@ async function loginCommand(args: string[]): Promise<void> {
     ...(loginHeadless !== undefined ? { loginHeadless: loginHeadless as "auto" | "force" | "off" } : {}),
     ...(storageStateFile ? { storageStateFile } : {}),
     ...(email && password ? { email, password } : {}),
+    mfaCodePrompt: email && password && stdin.isTTY && stdout.isTTY
+      ? () => prompt("ChatGPT e-mail verification code (check your inbox): ")
+      : undefined,
   });
   stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
 }
