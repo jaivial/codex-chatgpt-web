@@ -94,13 +94,70 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
 function assertMacOs(): void {
   if (process.platform !== "darwin") {
     throw new Error(
-      "Terminal-managed background services require macOS. "
-      + "Use the Codex Web GPT launcher on Windows or Linux.",
+      "launchd-managed background services require macOS. "
+      + "On Linux this command is managed with systemd user units.",
     );
   }
 }
 
+function systemdUnitPath(): string {
+  return join(homedir(), ".config", "systemd", "user", `${LABEL}.service`);
+}
+
+function systemdExecArg(arg: string): string {
+  return /\s/.test(arg)
+    ? `"${arg.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+    : arg;
+}
+
+export function systemdUnit(config: AppConfig): string {
+  const args = [...config.runtimeCommand, "serve"].map(systemdExecArg);
+  return `# Managed by codex-chatgpt-web; \`codex-chatgpt-web service uninstall\` removes this unit.
+[Unit]
+Description=Codex Web GPT Responses bridge (headless daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${args.join(" ")}
+Environment=CODEX_CHATGPT_WEB_HOME=${getConfigDir()}
+Environment=CODEX_CHATGPT_WEB_HEADLESS=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function systemctl(...args: string[]): ReturnType<typeof runCommand> {
+  return runCommand("systemctl", ["--user", ...args]);
+}
+
+function enableLingerBestEffort(): void {
+  const result = runCommand("loginctl", ["enable-linger", String(userInfo().username)]);
+  if (result.status !== 0) {
+    process.stdout.write(
+      "Warning: could not enable linger (`loginctl enable-linger`); the service will stop when your last session ends.\n",
+    );
+  }
+}
+
+function isLinux(): boolean {
+  return process.platform === "linux";
+}
+
 export function getServiceStatus(): ServiceStatus {
+  if (isLinux()) {
+    const path = systemdUnitPath();
+    return {
+      supported: true,
+      installed: existsSync(path),
+      loaded: systemctl("is-active", "--quiet", LABEL).status === 0,
+      label: LABEL,
+      definitionPath: path,
+    };
+  }
   if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: LABEL };
   const path = plistPath();
   const result = runCommand("launchctl", ["print", serviceTarget()]);
@@ -114,6 +171,17 @@ export function getServiceStatus(): ServiceStatus {
 }
 
 export function installService(config: AppConfig): ServiceStatus {
+  if (isLinux()) {
+    assertDurableRuntimeCommand(config.runtimeCommand);
+    const path = systemdUnitPath();
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const next = systemdUnit(config);
+    if (!existsSync(path) || readFileSync(path, "utf8") !== next) atomicWriteFile(path, next);
+    systemctl("daemon-reload");
+    runChecked("systemctl", ["--user", "enable", "--now", LABEL]);
+    enableLingerBestEffort();
+    return getServiceStatus();
+  }
   assertMacOs();
   assertDurableRuntimeCommand(config.runtimeCommand);
   const path = plistPath();
@@ -127,6 +195,11 @@ export function installService(config: AppConfig): ServiceStatus {
 }
 
 export function startService(): ServiceStatus {
+  if (isLinux()) {
+    if (!existsSync(systemdUnitPath())) throw new Error(`Service is not installed: ${systemdUnitPath()}`);
+    runChecked("systemctl", ["--user", "start", LABEL]);
+    return getServiceStatus();
+  }
   assertMacOs();
   const path = plistPath();
   if (!existsSync(path)) throw new Error(`Service is not installed: ${path}`);
@@ -231,6 +304,16 @@ export async function assertServiceIdle(config: AppConfig): Promise<void> {
 }
 
 export async function restartService(config: AppConfig): Promise<ServiceStatus> {
+  if (isLinux()) {
+    if (!getServiceStatus().loaded) return startService();
+    const lease = await acquireDrain(config);
+    try {
+      runChecked("systemctl", ["--user", "restart", LABEL]);
+    } catch (error) {
+      return releaseDrainAfterFailure(lease, error);
+    }
+    return getServiceStatus();
+  }
   assertMacOs();
   if (!getServiceStatus().loaded) return startService();
   const lease = await acquireDrain(config);
@@ -255,6 +338,17 @@ export function removeLegacyRuntimeArtifacts(config: AppConfig): void {
 }
 
 export async function stopService(config: AppConfig): Promise<ServiceStatus> {
+  if (isLinux()) {
+    if (getServiceStatus().loaded) {
+      const lease = await acquireDrain(config);
+      try {
+        runChecked("systemctl", ["--user", "stop", LABEL]);
+      } catch (error) {
+        return releaseDrainAfterFailure(lease, error);
+      }
+    }
+    return getServiceStatus();
+  }
   assertMacOs();
   if (getServiceStatus().loaded) {
     const lease = await acquireDrain(config);
@@ -269,6 +363,19 @@ export async function stopService(config: AppConfig): Promise<ServiceStatus> {
 }
 
 export async function uninstallService(config: AppConfig): Promise<ServiceStatus> {
+  if (isLinux()) {
+    if (getServiceStatus().loaded) {
+      const lease = await acquireDrain(config);
+      try {
+        runChecked("systemctl", ["--user", "disable", "--now", LABEL]);
+      } catch (error) {
+        return releaseDrainAfterFailure(lease, error);
+      }
+    }
+    rmSync(systemdUnitPath(), { force: true });
+    systemctl("daemon-reload");
+    return getServiceStatus();
+  }
   assertMacOs();
   if (getServiceStatus().loaded) {
     const lease = await acquireDrain(config);

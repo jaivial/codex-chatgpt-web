@@ -66,6 +66,10 @@ Setup options:
   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
+  --login-headless MODE        auto (default) | force | off for the login command; auto falls back to ephemeral Xvfb
+  --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
+  --browser-host MODE          managed-chrome (headless default) | launcher for setup
+  --headless                   Setup turns run headless (managed-chrome, no display)
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --bigger-context             Enable experimental adaptive 1/2/3-message context
   --standard-context           Disable experimental multi-message context
@@ -143,12 +147,20 @@ function authorizeLauncherControl(operation: string): void {
 }
 
 async function loginCommand(args: string[]): Promise<void> {
+  const loginHeadless = takeOption(args, "--login-headless");
+  const storageStateFile = takeOption(args, "--storage-state-file");
   assertNoArgs(args);
+  if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
+    throw new Error("--login-headless must be auto, force, or off");
+  }
   const config = loadConfig();
   if (config.browserHost === "launcher") {
     throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
   }
-  const result = await loginToChatGpt(config);
+  const result = await loginToChatGpt(config, {
+    ...(loginHeadless !== undefined ? { loginHeadless: loginHeadless as "auto" | "force" | "off" } : {}),
+    ...(storageStateFile ? { storageStateFile } : {}),
+  });
   stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
 }
 
@@ -174,6 +186,19 @@ async function setupCommand(args: string[]): Promise<void> {
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
+  const browserHost = takeOption(args, "--browser-host");
+  if (browserHost !== undefined && browserHost !== "managed-chrome" && browserHost !== "launcher") {
+    throw new Error("--browser-host must be managed-chrome or launcher");
+  }
+  if (browserHost) options.browserHost = browserHost;
+  if (takeFlag(args, "--headless")) options.headed = false;
+  const loginHeadless = takeOption(args, "--login-headless");
+  if (loginHeadless !== undefined) {
+    if (loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
+      throw new Error("--login-headless must be auto, force, or off");
+    }
+    options.loginHeadless = loginHeadless as "auto" | "force" | "off";
+  }
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");

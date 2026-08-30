@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { chromium, type BrowserContextOptions } from "playwright-core";
+import { chromium, type BrowserContextOptions, type Page } from "playwright-core";
+import { runCommand } from "./process";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
 import {
@@ -47,10 +48,11 @@ function writeVerificationMarker(
 async function inspectStoredState(
   config: AppConfig,
   storageState: NonNullable<BrowserContextOptions["storageState"]>,
+  headless = false,
 ): Promise<ChatGptWebAccountCapabilities & { url: string }> {
   const verifierBrowser = await chromium.launch({
     executablePath: config.chromeExecutablePath,
-    headless: false,
+    headless,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
     args: ["--no-first-run", "--no-default-browser-check"],
   });
@@ -93,15 +95,129 @@ export function storedBrowserLoginCapabilities(
   }
 }
 
-export async function loginToChatGpt(
-  config: AppConfig,
-  options: { timeoutMs?: number } = {},
-): Promise<BrowserLoginResult> {
-  if (!existsSync(config.chromeExecutablePath)) {
-    throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
+export type LoginHeadlessMode = "auto" | "force" | "off";
+
+export interface LoginToChatGptOptions {
+  timeoutMs?: number;
+  loginHeadless?: LoginHeadlessMode;
+  storageStateFile?: string;
+}
+
+const CHROME_LAUNCH_ARGS = ["--no-first-run", "--no-default-browser-check"];
+const CHROME_IGNORE_DEFAULT_ARGS = ["--password-store=basic", "--use-mock-keychain"];
+
+function composerLocator(page: Page) {
+  return page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
+    page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
+  ).first();
+}
+
+async function headlessLoginBlocked(page: Page): Promise<boolean> {
+  const content = await page.content().catch(() => "");
+  return /challenge-platform|just a moment|verify you are human|cf-please-wait/i.test(content);
+}
+
+async function withEphemeralXvfb<T>(fn: (display: string) => Promise<T>): Promise<T> {
+  const probe = runCommand("which", ["Xvfb"]);
+  if (probe.status !== 0) {
+    throw new Error(
+      "Headless ChatGPT login was blocked and Xvfb is not installed. "
+      + "Install xvfb, import a storage state via --storage-state-file, or log in on a machine with a display.",
+    );
   }
-  const profileDir = join(dirname(config.storageStatePath), "login-profile");
-  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const { readdirSync } = await import("node:fs");
+  const existing = new Set(readdirSync("/tmp/.X11-unix").map(name => name.replace(/^X/, "")));
+  let display: string | undefined;
+  for (let candidate = 99; candidate < 200; candidate += 1) {
+    if (!existing.has(String(candidate))) { display = `:${candidate}`; break; }
+  }
+  if (!display) throw new Error("No free display number found for ephemeral Xvfb");
+  const xvfb = spawn("Xvfb", [display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"], { stdio: "ignore" });
+  await new Promise(resolveWait => setTimeout(resolveWait, 800));
+  if (xvfb.exitCode !== null && xvfb.exitCode !== 0) throw new Error(`Xvfb exited with status ${xvfb.exitCode}`);
+  try {
+    return await fn(display);
+  } finally {
+    xvfb.kill("SIGTERM");
+    setTimeout(() => xvfb.kill("SIGKILL"), 2_000).unref?.();
+  }
+}
+
+async function finalizeLogin(
+  config: AppConfig,
+  context: Awaited<ReturnType<typeof chromium.launchPersistentContext>>,
+  page: Page,
+  headless: boolean,
+): Promise<BrowserLoginResult> {
+  await assertAuthenticatedChatGptPage(page);
+  await assertTemporaryChatPage(page);
+  const state = await context.storageState();
+  const inspected = await inspectStoredState(config, state, headless);
+  atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
+  writeVerificationMarker(config.storageStatePath, inspected);
+  return {
+    storageStatePath: config.storageStatePath,
+    accountSurfaceUrl: page.url(),
+    solAvailable: inspected.solAvailable,
+    proAvailable: inspected.proAvailable,
+  };
+}
+
+async function importStorageStateFile(
+  config: AppConfig,
+  storageStateFile: string,
+): Promise<BrowserLoginResult> {
+  if (!existsSync(storageStateFile)) throw new Error(`Storage state file not found: ${storageStateFile}`);
+  let state: unknown;
+  try {
+    state = JSON.parse(readFileSync(storageStateFile, "utf8"));
+  } catch {
+    throw new Error(`Storage state file is not valid JSON: ${storageStateFile}`);
+  }
+  if (typeof state !== "object" || state === null || !Array.isArray((state as { cookies?: unknown }).cookies)) {
+    throw new Error("Storage state file must be a Playwright storageState object with a cookies array");
+  }
+  const inspected = await inspectStoredState(config, state as NonNullable<BrowserContextOptions["storageState"]>, true);
+  atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
+  writeVerificationMarker(config.storageStatePath, inspected);
+  return {
+    storageStatePath: config.storageStatePath,
+    accountSurfaceUrl: inspected.url,
+    solAvailable: inspected.solAvailable,
+    proAvailable: inspected.proAvailable,
+  };
+}
+
+async function attemptPersistentLogin(
+  config: AppConfig,
+  profileDir: string,
+  headless: boolean,
+  timeoutMs: number,
+): Promise<BrowserLoginResult> {
+  const context = await chromium.launchPersistentContext(profileDir, {
+    executablePath: config.chromeExecutablePath,
+    headless,
+    ignoreDefaultArgs: CHROME_IGNORE_DEFAULT_ARGS,
+    args: CHROME_LAUNCH_ARGS,
+  });
+  try {
+    const page = context.pages()[0] ?? await context.newPage();
+    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    try {
+      await composerLocator(page).waitFor({ state: "visible", timeout: timeoutMs });
+    } catch {
+      if (headless && await headlessLoginBlocked(page)) {
+        throw new Error("HEADLESS_BLOCKED: ChatGPT served a bot challenge to the headless browser");
+      }
+      throw new Error("The authenticated ChatGPT page did not produce a visible composer");
+    }
+    return await finalizeLogin(config, context, page, headless);
+  } finally {
+    await context.close();
+  }
+}
+
+async function headedChromeLoginWindow(config: AppConfig, profileDir: string, display?: string): Promise<void> {
   process.stdout.write(
     "A normal Chrome window is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
   );
@@ -109,10 +225,9 @@ export async function loginToChatGpt(
     `--user-data-dir=${profileDir}`,
     "--new-window",
     "--disable-background-mode",
-    "--no-first-run",
-    "--no-default-browser-check",
+    ...CHROME_LAUNCH_ARGS,
     CHATGPT_TEMPORARY_CHAT_URL,
-  ], { env: process.env, stdio: "ignore" });
+  ], { env: display ? { ...process.env, DISPLAY: display } : process.env, stdio: "ignore" });
   const loginExit = await new Promise<number>((resolveExit, rejectExit) => {
     loginBrowser.once("error", rejectExit);
     loginBrowser.once("exit", (code, signal) => {
@@ -121,42 +236,37 @@ export async function loginToChatGpt(
     });
   });
   if (loginExit !== 0) throw new Error(`Normal Chrome login window exited with status ${loginExit}`);
+}
 
-  const context = await chromium.launchPersistentContext(profileDir, {
-    executablePath: config.chromeExecutablePath,
-    headless: false,
-    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check"],
-  });
+export async function loginToChatGpt(
+  config: AppConfig,
+  options: LoginToChatGptOptions = {},
+): Promise<BrowserLoginResult> {
+  if (!existsSync(config.chromeExecutablePath)) {
+    throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
+  }
+  if (options.storageStateFile) return importStorageStateFile(config, options.storageStateFile);
+  const profileDir = join(dirname(config.storageStatePath), "login-profile");
+  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const mode: LoginHeadlessMode = options.loginHeadless ?? "auto";
   try {
-    const page = context.pages()[0] ?? await context.newPage();
-    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60_000,
-    });
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
-      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
-    ).first();
-    try {
-      await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
-    } catch {
-      throw new Error("The authenticated ChatGPT page did not produce a visible composer");
+    if (mode !== "off") {
+      try {
+        return await attemptPersistentLogin(config, profileDir, true, Math.min(timeoutMs, 45_000));
+      } catch (error) {
+        const blocked = error instanceof Error && error.message.startsWith("HEADLESS_BLOCKED");
+        if (mode === "force" || !blocked) throw error;
+        process.stdout.write("Headless login was blocked by a bot challenge; retrying under ephemeral Xvfb.\n");
+      }
+      return await withEphemeralXvfb(async display => {
+        await headedChromeLoginWindow(config, profileDir, display);
+        return attemptPersistentLogin(config, profileDir, false, timeoutMs);
+      });
     }
-    await assertAuthenticatedChatGptPage(page);
-    await assertTemporaryChatPage(page);
-    const state = await context.storageState();
-
-    const inspected = await inspectStoredState(config, state);
-    atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
-    writeVerificationMarker(config.storageStatePath, inspected);
-    return {
-      storageStatePath: config.storageStatePath,
-      accountSurfaceUrl: page.url(),
-      solAvailable: inspected.solAvailable,
-      proAvailable: inspected.proAvailable,
-    };
+    await headedChromeLoginWindow(config, profileDir);
+    return await attemptPersistentLogin(config, profileDir, false, timeoutMs);
   } finally {
-    await context.close();
     if (browserLoginStateExists(config)) rmSync(profileDir, { recursive: true, force: true });
   }
 }

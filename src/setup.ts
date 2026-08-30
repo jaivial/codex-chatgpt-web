@@ -48,6 +48,9 @@ export interface SetupOptions {
   port?: number;
   chromeExecutablePath?: string;
   browserHostDescriptorPath?: string;
+  browserHost?: "managed-chrome" | "launcher";
+  headed?: boolean;
+  loginHeadless?: "auto" | "force" | "off";
   refreshAccountCapabilities?: boolean;
   appName?: string;
   forceLogin?: boolean;
@@ -221,10 +224,14 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
     config.browserHost = "launcher";
     config.browserHostDescriptorPath = options.browserHostDescriptorPath;
     config.brokerSocketPath = defaultBrokerEndpoint();
+  } else if (options.browserHost) {
+    config.browserHost = options.browserHost;
+    if (options.browserHost === "managed-chrome") delete config.browserHostDescriptorPath;
   } else if (options.chromeExecutablePath) {
     config.browserHost = "managed-chrome";
     delete config.browserHostDescriptorPath;
   }
+  if (options.headed !== undefined) config.headed = options.headed;
   config.appName = resolveSetupConnectorName(existing?.appName, options.appName);
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
   if (options.experimentalBiggerContext !== undefined) {
@@ -375,7 +382,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     }
     if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && existing) await assertServiceIdle(existing);
     if (loginRequired) {
-      const login = await loginToChatGpt(config);
+      const login = await loginToChatGpt(config, { ...(options.loginHeadless ? { loginHeadless: options.loginHeadless } : {}) });
       solAvailable = login.solAvailable;
       proAvailable = login.proAvailable;
       loginCreated = true;
