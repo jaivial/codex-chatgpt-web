@@ -5,7 +5,7 @@
  * Raised from 90s so long reasoning + large tool writes are not cut mid-turn.
  * Hung streams still die; they just get a more realistic window.
  */
-export const DEFAULT_STALL_TIMEOUT_SEC = 300;
+export const DEFAULT_STALL_TIMEOUT_SEC = 900;
 
 /**
  * Resolve the effective bridge stall deadline for a turn.
