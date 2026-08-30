@@ -1311,6 +1311,7 @@ export class ChatGptBrowserWorker {
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
+  private lastTurnActivityAt = 0;
   private readonly activeRuns = new Map<string, Promise<string>>();
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
@@ -3159,8 +3160,9 @@ export class ChatGptBrowserWorker {
           maxMessageChars,
         );
       }
+      // Cap unbounded turns: codex background-terminal waits must not hang the SSE forever.
       const deadline = this.config.turnTimeoutMs === undefined
-        ? undefined
+        ? Date.now() + 30 * 60_000
         : Date.now() + this.config.turnTimeoutMs;
       let page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
         if (maintenancePage) return maintenancePage;
@@ -3232,6 +3234,19 @@ export class ChatGptBrowserWorker {
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
       );
+      if (reuseConversation && Date.now() - this.lastTurnActivityAt > 120_000) {
+        // Long idle gaps (codex background terminals) let ChatGPT drop the temp-chat
+        // stream; reload the surface before sending or the stage send stalls forever.
+        await this.runStage(
+          turn.traceId,
+          "idle_reconnect_preparation",
+          browserStageTimeouts.temporaryChatPreparation,
+          () => this.prepareTemporaryChatSurface(
+            page,
+            checkpoint => diagnostics.capture(page, checkpoint),
+          ),
+        );
+      }
       if (!reuseConversation) {
         await this.runStage(
           turn.traceId,
@@ -3620,6 +3635,7 @@ export class ChatGptBrowserWorker {
       }
       throw error;
     } finally {
+      this.lastTurnActivityAt = Date.now();
       prepared.release();
       if (turnConnection) {
         await turnConnection.close().catch(error => {
