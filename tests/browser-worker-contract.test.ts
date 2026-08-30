@@ -1898,7 +1898,8 @@ test("response DOM separates streaming commentary from the final Markdown answer
   expect(workerSource).toContain("const commentaryRoots = allMarkdownRoots.filter");
   expect(workerSource).toContain('candidate.closest("[data-streaming-response-status]") !== null');
   expect(workerSource).toContain("const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>");
-  expect(workerSource).toContain("candidate.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING");
+  expect(workerSource).toContain("const firstStreamingStatusContainer = streamingStatusContainers[0]");
+  expect(workerSource).toContain("candidate.compareDocumentPosition(firstStreamingStatusContainer)");
   expect(workerSource).toContain("const renderedRoots = allMarkdownRoots.filter");
   expect(workerSource).toContain("!commentaryRoots.includes(candidate)");
   expect(workerSource).toContain('fullHtml: renderedRoots.map(candidate => candidate.innerHTML).join("")');
@@ -2123,4 +2124,133 @@ test("visible reasoning keeps the browser turn healthy before final assistant ma
   };
   expect(health.update(reasoning, 1_000)).toBeUndefined();
   expect(health.update(reasoning, 10_000)).toBeUndefined();
+});
+
+test("suspending DOM health for proven MCP progress restarts the missing-response window", () => {
+  const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
+  const absent = {
+    responsePresent: false,
+    running: true,
+    currentText: "",
+    completionActionVisible: false,
+  };
+
+  // The response DOM is unavailable from the first observation, so the window opens here.
+  expect(tracker.update(absent, 1_000)).toBeUndefined();
+
+  // Proven tool-call activity suspends the check. Charging that suspended stretch against the
+  // grace period is what let a live turn be cancelled the moment liveness lapsed.
+  tracker.clearMissingResponse();
+
+  expect(tracker.update(absent, 10_000)).toBeUndefined();
+  expect(tracker.update(absent, 10_999)).toBeUndefined();
+  expect(tracker.update(absent, 11_000)).toContain("did not create a response DOM");
+});
+
+test("clearing the missing-response window preserves whether a response was ever observed", () => {
+  const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
+  const present = {
+    responsePresent: true,
+    running: true,
+    currentText: "partial",
+    completionActionVisible: false,
+  };
+  const absent = { ...present, responsePresent: false, currentText: "" };
+
+  expect(tracker.update(present, 1_000)).toBeUndefined();
+  expect(tracker.update(absent, 1_500)).toBeUndefined();
+  tracker.clearMissingResponse();
+  expect(tracker.update(absent, 5_000)).toBeUndefined();
+  expect(tracker.update(absent, 6_000)).toContain("response DOM disappeared");
+});
+
+test("the launcher helper transport carries MCP progress into the out-of-process browser worker", () => {
+  const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
+  const helper = readFileSync("src/adapters/chatgpt-web/browser-helper-main.ts", "utf8");
+
+  // The browser worker runs in the helper process while the Codex MCP broker runs in the daemon.
+  // If progress stops crossing that boundary the worker silently observes "never live" and cancels
+  // turns whose tool calls are still completing, so both ends of the transport are asserted here.
+  expect(client).toContain("forwardProgress");
+  expect(client).toMatch(/type: "progress", id: turn\.traceId, snapshot/);
+  expect(helper).toMatch(/message\.type === "progress"/);
+  expect(helper).toContain("ChatGptMirroredTurnProgress");
+  expect(helper).toMatch(/externalProgress: progress/);
+});
+
+test("turn cancellation heuristics defer to proven MCP progress in both wait loops", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const guarded = worker.match(/stoppedThinkingTracker\.update\([^)]*\)\s*&&\s*!externalProgressLive/g) ?? [];
+
+  // A stale "Stopped thinking" label must not cancel a turn that is still driving tool calls, and
+  // the multipart staging loop must not be the one place that skips the liveness guard.
+  expect(guarded.length).toBe(2);
+  expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(2);
+});
+
+test("proven MCP progress vetoes every terminal DOM conclusion, not just a missing response", () => {
+  // Reproduces trace 970896e96e84: the response DOM is present and the renderer never exposes a
+  // completed-turn action, yet tool calls keep completing. "Stopped generating" is false there.
+  const stalled = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const answeredWithoutCompletionAction = {
+    responsePresent: true,
+    running: false,
+    currentText: "partial answer",
+    completionActionVisible: false,
+  };
+
+  expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 1_000)).toBeUndefined();
+  expect(stalled.update({ ...answeredWithoutCompletionAction, externalProgressLive: true }, 10_000)).toBeUndefined();
+
+  // Once the model genuinely stops, the window starts fresh rather than charging the live stretch.
+  expect(stalled.update(answeredWithoutCompletionAction, 10_100)).toBeUndefined();
+  expect(stalled.update(answeredWithoutCompletionAction, 10_849)).toBeUndefined();
+  expect(stalled.update(answeredWithoutCompletionAction, 10_850)).toContain("did not expose its completed-turn action");
+
+  const empty = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const completedEmpty = {
+    responsePresent: true,
+    running: false,
+    currentText: "",
+    completionActionVisible: true,
+  };
+  expect(empty.update({ ...completedEmpty, externalProgressLive: true }, 1_000)).toBeUndefined();
+  expect(empty.update({ ...completedEmpty, externalProgressLive: true }, 9_000)).toBeUndefined();
+  expect(empty.update(completedEmpty, 9_100)).toBeUndefined();
+  expect(empty.update(completedEmpty, 9_600)).toContain("completed without a final answer");
+});
+
+test("live external progress still records that a response DOM was observed", () => {
+  const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
+  const absent = {
+    responsePresent: false,
+    running: true,
+    currentText: "",
+    completionActionVisible: false,
+  };
+
+  expect(tracker.update({
+    responsePresent: true,
+    running: true,
+    currentText: "",
+    completionActionVisible: false,
+    externalProgressLive: true,
+  }, 1_000)).toBeUndefined();
+
+  // The turn is reported as vanished rather than never created, so `sawResponse` survived.
+  expect(tracker.update(absent, 2_000)).toBeUndefined();
+  expect(tracker.update(absent, 3_000)).toContain("response DOM disappeared");
+});
+
+test("answer Markdown is not reclassified as commentary when a later tool call opens a status container", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+
+  // Commentary is Markdown that precedes the FIRST streaming status container. Keying it on "some
+  // status follows me" made every answer chunk emitted before a second tool call look like prior
+  // commentary, which zeroed the visible text and silently dropped answer content.
+  expect(worker).toContain("const firstStreamingStatusContainer = streamingStatusContainers[0]");
+  expect(worker).toMatch(/candidate\.compareDocumentPosition\(firstStreamingStatusContainer\)/);
+  expect(worker).not.toMatch(
+    /streamingStatusContainers\.some\(status => \(\s*Boolean\(candidate\.compareDocumentPosition\(status\)/,
+  );
 });
