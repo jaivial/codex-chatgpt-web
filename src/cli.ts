@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
 import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
@@ -68,6 +69,8 @@ Setup options:
   --login                      Refresh the stored ChatGPT login even if one exists
   --login-headless MODE        auto (default) | force | off for the login command; auto falls back to ephemeral Xvfb
   --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
+  --email EMAIL                Credential login: drives auth.openai.com headlessly
+  --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
   --browser-host MODE          managed-chrome (headless default) | launcher for setup
   --headless                   Setup turns run headless (managed-chrome, no display)
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
@@ -149,9 +152,22 @@ function authorizeLauncherControl(operation: string): void {
 async function loginCommand(args: string[]): Promise<void> {
   const loginHeadless = takeOption(args, "--login-headless");
   const storageStateFile = takeOption(args, "--storage-state-file");
+  const email = takeOption(args, "--email");
+  const passwordFile = takeOption(args, "--password-file");
   assertNoArgs(args);
   if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
     throw new Error("--login-headless must be auto, force, or off");
+  }
+  let password: string | undefined;
+  if (passwordFile) {
+    password = readFileSync(passwordFile, "utf8").replace(/\r?\n$/, "");
+    if (!password) throw new Error(`--password-file is empty: ${passwordFile}`);
+  } else if (email) {
+    password = process.env.CODEX_CHATGPT_WEB_PASSWORD;
+    if (!password) throw new Error("Credential login needs --password-file or CODEX_CHATGPT_WEB_PASSWORD");
+  }
+  if ((email === undefined) !== (password === undefined)) {
+    throw new Error("--email requires --password-file (or CODEX_CHATGPT_WEB_PASSWORD); they are used together");
   }
   const config = loadConfig();
   if (config.browserHost === "launcher") {
@@ -160,6 +176,7 @@ async function loginCommand(args: string[]): Promise<void> {
   const result = await loginToChatGpt(config, {
     ...(loginHeadless !== undefined ? { loginHeadless: loginHeadless as "auto" | "force" | "off" } : {}),
     ...(storageStateFile ? { storageStateFile } : {}),
+    ...(email && password ? { email, password } : {}),
   });
   stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
 }

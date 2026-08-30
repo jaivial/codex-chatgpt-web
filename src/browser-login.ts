@@ -101,6 +101,58 @@ export interface LoginToChatGptOptions {
   timeoutMs?: number;
   loginHeadless?: LoginHeadlessMode;
   storageStateFile?: string;
+  email?: string;
+  password?: string;
+}
+
+const AUTH_LOGIN_URL = "https://auth.openai.com/log-in";
+
+async function attemptCredentialLogin(
+  config: AppConfig,
+  profileDir: string,
+  email: string,
+  password: string,
+  headless: boolean,
+  timeoutMs: number,
+): Promise<BrowserLoginResult> {
+  const context = await chromium.launchPersistentContext(profileDir, {
+    executablePath: config.chromeExecutablePath,
+    headless,
+    ignoreDefaultArgs: CHROME_IGNORE_DEFAULT_ARGS,
+    args: CHROME_LAUNCH_ARGS,
+  });
+  let page: Page | undefined;
+  try {
+    page = context.pages()[0] ?? await context.newPage();
+    await page.goto(AUTH_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    const emailInput = page.locator('input[name="email"], input#email-input, input[type="email"]').first();
+    await emailInput.waitFor({ state: "visible", timeout: 30_000 });
+    await emailInput.fill(email);
+    await page.getByRole("button", { name: /continue/i }).first().click();
+    const passwordInput = page.locator('input[type="password"]').first();
+    await passwordInput.waitFor({ state: "visible", timeout: 30_000 });
+    await passwordInput.fill(password);
+    await page.getByRole("button", { name: /continue|log in/i }).first().click();
+    await page.waitForURL(/chatgpt\.com/, { timeout: 120_000 });
+    await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    const composer = composerLocator(page);
+    try {
+      await composer.waitFor({ state: "visible", timeout: timeoutMs });
+    } catch {
+      if (await headlessLoginBlocked(page)) {
+        throw new Error("CREDENTIAL_LOGIN_BLOCKED: ChatGPT served a bot challenge during credential login");
+      }
+      throw new Error("Credential login finished but no ChatGPT composer appeared (check email/password or complete any verification manually)");
+    }
+    return await finalizeLogin(config, context, page, headless);
+  } catch (error) {
+    if (page && headless && await headlessLoginBlocked(page).catch(() => false)) {
+      throw new Error("CREDENTIAL_LOGIN_BLOCKED: bot challenge during credential login");
+    }
+    throw error;
+  } finally {
+    await context.close();
+  }
 }
 
 const CHROME_LAUNCH_ARGS = ["--no-first-run", "--no-default-browser-check"];
@@ -246,6 +298,21 @@ export async function loginToChatGpt(
     throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
   }
   if (options.storageStateFile) return importStorageStateFile(config, options.storageStateFile);
+  const credentialLogin = options.email !== undefined || options.password !== undefined;
+  if (credentialLogin) {
+    if (options.email === undefined || options.password === undefined || !options.email || !options.password) {
+      throw new Error("Credential login requires both --email and a password (--password-file or CODEX_CHATGPT_WEB_PASSWORD)");
+    }
+    const tryCreds = (headless: boolean) => attemptCredentialLogin(config, profileDir, options.email!, options.password!, headless, timeoutMs);
+    try {
+      return await tryCreds(true);
+    } catch (error) {
+      const blocked = error instanceof Error && error.message.startsWith("CREDENTIAL_LOGIN_BLOCKED");
+      if (!blocked || options.loginHeadless === "force") throw error;
+      process.stdout.write("Headless credential login hit a bot challenge; retrying under ephemeral Xvfb.\n");
+      return await withEphemeralXvfb(() => tryCreds(false));
+    }
+  }
   const profileDir = join(dirname(config.storageStatePath), "login-profile");
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
   const timeoutMs = options.timeoutMs ?? 60_000;
