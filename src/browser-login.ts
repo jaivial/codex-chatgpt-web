@@ -104,6 +104,7 @@ export interface LoginToChatGptOptions {
   email?: string;
   password?: string;
   mfaCodePrompt?: () => Promise<string>;
+  sessionCookie?: string;
 }
 
 const AUTH_LOGIN_URL = "https://auth.openai.com/log-in";
@@ -230,6 +231,56 @@ async function finalizeLogin(
   };
 }
 
+export function parseSessionCookieInput(raw: string): NonNullable<BrowserContextOptions["storageState"]> {
+  const input = raw.trim();
+  if (input.startsWith("{")) {
+    const state = JSON.parse(input) as { cookies?: unknown };
+    if (!Array.isArray(state.cookies) || state.cookies.length === 0) {
+      throw new Error("Storage state JSON must contain a non-empty cookies array");
+    }
+    return state as NonNullable<BrowserContextOptions["storageState"]>;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const pairs = input.includes("=")
+    ? input.split(";").map(pair => pair.trim()).filter(Boolean).map(pair => {
+        const eq = pair.indexOf("=");
+        return { name: pair.slice(0, eq), value: pair.slice(eq + 1) };
+      })
+    : [{ name: "__Secure-next-auth.session-token", value: input }];
+  if (pairs.some(pair => !pair.name || !pair.value)) {
+    throw new Error("Could not parse cookie input; paste name=value pairs or a storageState JSON");
+  }
+  return {
+    cookies: pairs.map(pair => ({
+      name: pair.name,
+      value: pair.value,
+      domain: ".chatgpt.com",
+      path: "/",
+      secure: true,
+      httpOnly: pair.name.includes("session-token"),
+      sameSite: "Lax",
+      expires: now + 60 * 60 * 24 * 30,
+    })),
+    origins: [],
+  };
+}
+
+async function importSessionCookieInput(
+  config: AppConfig,
+  raw: string,
+): Promise<BrowserLoginResult> {
+  const state = parseSessionCookieInput(raw);
+  const inspected = await inspectStoredState(config, state, true);
+  atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
+  writeVerificationMarker(config.storageStatePath, inspected);
+  return {
+    storageStatePath: config.storageStatePath,
+    accountSurfaceUrl: inspected.url,
+    solAvailable: inspected.solAvailable,
+    proAvailable: inspected.proAvailable,
+  };
+}
+
 async function importStorageStateFile(
   config: AppConfig,
   storageStateFile: string,
@@ -312,7 +363,12 @@ export async function loginToChatGpt(
   if (!existsSync(config.chromeExecutablePath)) {
     throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
   }
+  if (options.sessionCookie) return importSessionCookieInput(config, options.sessionCookie);
   if (options.storageStateFile) return importStorageStateFile(config, options.storageStateFile);
+  const profileDir = join(dirname(config.storageStatePath), "login-profile");
+  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const mode: LoginHeadlessMode = options.loginHeadless ?? "auto";
   const credentialLogin = options.email !== undefined || options.password !== undefined;
   if (credentialLogin) {
     if (options.email === undefined || options.password === undefined || !options.email || !options.password) {
@@ -328,10 +384,6 @@ export async function loginToChatGpt(
       return await withEphemeralXvfb(() => tryCreds(false));
     }
   }
-  const profileDir = join(dirname(config.storageStatePath), "login-profile");
-  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-  const timeoutMs = options.timeoutMs ?? 60_000;
-  const mode: LoginHeadlessMode = options.loginHeadless ?? "auto";
   try {
     if (mode !== "off") {
       try {

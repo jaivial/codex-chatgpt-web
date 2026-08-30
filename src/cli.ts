@@ -71,6 +71,8 @@ Setup options:
   --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
   --no-device                  Pure headless login: never opens windows/Xvfb; bot challenge
                                fails hard. OTP arrives by e-mail (codex-style, no device).
+  --session-token-file PATH   File with __Secure-next-auth.session-token value (or full
+                               document.cookie / storageState JSON); or paste at prompt
   --email EMAIL                Credential login: drives auth.openai.com headlessly; omit both
                                --email/--password-file on a TTY for fully interactive prompts
   --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
@@ -158,12 +160,23 @@ async function loginCommand(args: string[]): Promise<void> {
   let email = takeOption(args, "--email");
   const passwordFile = takeOption(args, "--password-file");
   const noDevice = takeFlag(args, "--no-device");
+  const sessionTokenFile = takeOption(args, "--session-token-file");
   assertNoArgs(args);
   if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
     throw new Error("--login-headless must be auto, force, or off");
   }
   // --no-device: pure headless, never spawn windows/Xvfb; bot challenge = hard error.
   const effectiveLoginHeadless = noDevice || loginHeadless === "force" ? "force" as const : loginHeadless;
+  let sessionCookie: string | undefined;
+  if (sessionTokenFile) {
+    sessionCookie = readFileSync(sessionTokenFile, "utf8").trim();
+    if (!sessionCookie) throw new Error(`--session-token-file is empty: ${sessionTokenFile}`);
+  } else if (process.env.CODEX_CHATGPT_WEB_SESSION_COOKIE) {
+    sessionCookie = process.env.CODEX_CHATGPT_WEB_SESSION_COOKIE;
+  } else if (!passwordFile && !email && !storageStateFile && stdin.isTTY && stdout.isTTY) {
+    stdout.write("Paste __Secure-next-auth.session-token from a logged-in chatgpt.com (DevTools > Application > Cookies), or full document.cookie / storageState JSON.\n");
+    sessionCookie = await secretPrompt("Session cookie: ");
+  }
   let password: string | undefined;
   if (passwordFile) {
     password = readFileSync(passwordFile, "utf8").replace(/\r?\n$/, "");
@@ -181,11 +194,15 @@ async function loginCommand(args: string[]): Promise<void> {
   if ((email === undefined) !== (password === undefined)) {
     throw new Error("--email requires --password-file (or CODEX_CHATGPT_WEB_PASSWORD); they are used together");
   }
+  if (sessionCookie && (email || password)) {
+    throw new Error("Session-cookie login is exclusive of credential login");
+  }
   const config = loadConfig();
   if (config.browserHost === "launcher") {
     throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
   }
   const result = await loginToChatGpt(config, {
+    ...(sessionCookie ? { sessionCookie } : {}),
     ...(effectiveLoginHeadless !== undefined ? { loginHeadless: effectiveLoginHeadless } : {}),
     ...(storageStateFile ? { storageStateFile } : {}),
     ...(email && password ? { email, password } : {}),
