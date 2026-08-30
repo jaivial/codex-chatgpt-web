@@ -108,6 +108,22 @@ bun run app
 
 This source path requires Bun 1.4.0. The command installs locked dependencies and opens the app.
 
+## Headless CLI mode (Linux servers)
+
+Full lifecycle from a terminal — no launcher, no Electron, no persistent Xvfb:
+
+```bash
+codex-chatgpt-web setup --full --browser-host managed-chrome --headless \
+  --chrome /usr/bin/google-chrome --login-headless auto --acknowledge-unofficial
+codex-chatgpt-web login             # headless-first; auto-falls back to ephemeral Xvfb
+codex-chatgpt-web service install   # systemd user unit (+ linger) for daemon and tunnel
+codex-chatgpt-web doctor            # xvfb, linger, browser-host, headless checks
+```
+
+- `--browser-host managed-chrome --headless` runs turns through a Playwright-managed headless Chrome.
+- `--login-headless auto` tries Chromium headless first; if ChatGPT serves a bot challenge it retries under an ephemeral Xvfb display. `--storage-state-file` imports a `storageState` JSON instead of interactive login.
+- `service` manages systemd **user** units (daemon + tunnel client, `Restart=always`, linger); macOS keeps launchd.
+
 ## Modes
 
 | Mode | Models | Local Codex tools | Extra setup |
