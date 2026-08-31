@@ -323,7 +323,7 @@ class BrowserHost {
       this.resumeListener = null;
     }
     this.boundsReady = false;
-    this.bounds = { x: 0, y: 0, width: 1, height: 1 };
+    this.bounds = { x: 0, y: 0, width: 1280, height: 800 };
     this.state = {
       status: "idle",
       message: "No active task",
@@ -408,6 +408,10 @@ class BrowserHost {
   }
 
   createTurnTab(traceId, helperPid, conversationKey, connectorIdentity) {
+    // Reaper: finished tabs keep stale surface ids and 0x0 viewports that break acquisition.
+    for (const staleTab of [...this.turnTabs.values()]) {
+      if (staleTab.status !== "running") this.removeTurnTab(staleTab, false);
+    }
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestRetainedTurnTab.call(this)) {
       throw new Error(
@@ -996,6 +1000,9 @@ class BrowserHost {
       normalizeBounds(scaleBrowserBounds(bounds, rendererZoomFactor)),
       { width, height },
     );
+    // Headless/Xvfb: never let the browser surface collapse below an operational viewport.
+    this.bounds.width = Math.max(this.bounds.width, 1280);
+    this.bounds.height = Math.max(this.bounds.height, 800);
     this.boundsReady = true;
     this.view.setBounds(this.bounds);
     this.authView?.setBounds(this.bounds);
@@ -1018,8 +1025,9 @@ class BrowserHost {
       // Electron collapses a hidden WebContentsView's renderer viewport to 0x0. Keep running
       // turn views visible to Chromium and move them wholly outside the launcher content area so
       // Playwright retains a real viewport without exposing the task to the user.
-      x: Math.max(width, Math.round(contentWidth || 0)) + 1,
-      y: Math.max(height, Math.round(contentHeight || 0)) + 1,
+      // Park on-screen: Xvfb/headless compositors still collapse offscreen views to 0x0.
+      x: 0,
+      y: 0,
       width,
       height,
     };
@@ -1076,7 +1084,10 @@ class BrowserHost {
     const visible = windowVisible
       && browserViewVisible(this.visible, this.surfaceActive, this.boundsReady);
     const selected = this.selectedTurnTab();
-    this.view.setVisible(visible && !this.authView && !selected);
+    const homeVisible = visible && !this.authView && !selected;
+    // Keep the home surface composited with a real viewport even when "hidden".
+    this.view.setBounds(homeVisible ? this.bounds : this.hiddenTurnBounds());
+    this.view.setVisible(true);
     for (const tab of this.turnTabs.values()) {
       const tabVisible = visible && !this.authView && selected?.id === tab.id;
       this.presentTurnView(tab, tabVisible);

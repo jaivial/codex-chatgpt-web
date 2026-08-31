@@ -5,7 +5,7 @@
  * Raised from 90s so long reasoning + large tool writes are not cut mid-turn.
  * Hung streams still die; they just get a more realistic window.
  */
-export const DEFAULT_STALL_TIMEOUT_SEC = 300;
+export const DEFAULT_STALL_TIMEOUT_SEC = 900;
 
 // Keep a malformed or accidentally enormous configuration within a practical recovery budget.
 export const MAX_STALL_TIMEOUT_SEC = 3_600;
