@@ -1003,6 +1003,9 @@ class BrowserHost {
     // Headless/Xvfb: never let the browser surface collapse below an operational viewport.
     this.bounds.width = Math.max(this.bounds.width, 1280);
     this.bounds.height = Math.max(this.bounds.height, 800);
+    // Cap surface so launcher shell UI stays reachable around the view.
+    this.bounds.width = Math.min(this.bounds.width, 1280);
+    this.bounds.height = Math.min(this.bounds.height, 800);
     this.boundsReady = true;
     this.view.setBounds(this.bounds);
     this.authView?.setBounds(this.bounds);
