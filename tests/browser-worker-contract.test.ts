@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, connectAfterClosingBrowserConnection, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -264,10 +264,59 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   const submissionAccepted = runBrowserTurn.indexOf("submission accepted evidence=");
   const recovery = runBrowserTurn.indexOf("await rebindLauncherPage(", submissionAccepted);
   const duplicateSend = runBrowserTurn.indexOf("sendAttachedPrompt(", recovery);
+
+  const rebindDefinition = runBrowserTurn.indexOf("const rebindLauncherPage");
+  const previousConnection = runBrowserTurn.indexOf(
+    "const previousConnection = turnConnection;",
+    rebindDefinition,
+  );
+  const failClosedDisconnect = runBrowserTurn.indexOf(
+    "connectAfterClosingBrowserConnection(",
+    previousConnection,
+  );
+  const detachClosedConnection = runBrowserTurn.indexOf(
+    "turnConnection = undefined;",
+    failClosedDisconnect,
+  );
+  const reconnectStage = runBrowserTurn.indexOf(
+    "return this.runStage(",
+    detachClosedConnection,
+  );
+  const reconnectTransport = runBrowserTurn.indexOf(
+    "const rebound = await connectLauncherBrowserHost(",
+    reconnectStage,
+  );
+
   expect(recovery).toBeGreaterThan(submissionAccepted);
   expect(duplicateSend).toBe(-1);
-  expect(runBrowserTurn).toContain("if (!launcherSurfaceId || !this.config.browserHostDescriptorPath) throw cause");
+  expect(rebindDefinition).toBeGreaterThan(-1);
+  expect(previousConnection).toBeGreaterThan(rebindDefinition);
+  expect(failClosedDisconnect).toBeGreaterThan(previousConnection);
+  expect(detachClosedConnection).toBeGreaterThan(failClosedDisconnect);
+  expect(reconnectStage).toBeGreaterThan(detachClosedConnection);
+  expect(reconnectTransport).toBeGreaterThan(reconnectStage);
+  expect(runBrowserTurn).not.toContain(
+    "previous browser observation connection did not close after rebind",
+  );
+  expect(runBrowserTurn).toContain(
+    "if (!launcherSurfaceId || !this.config.browserHostDescriptorPath) throw cause",
+  );
   expect(runBrowserTurn.slice(recovery)).toContain("responseTurn.identity");
+});
+
+test("a failed stale-browser disconnect prevents the replacement connection", async () => {
+  let replacementAttempts = 0;
+  const disconnectFailure = new Error("stale CDP transport did not close");
+
+  await expect(connectAfterClosingBrowserConnection(
+    { close: async () => { throw disconnectFailure; } },
+    async () => {
+      replacementAttempts += 1;
+      return "replacement";
+    },
+  )).rejects.toBe(disconnectFailure);
+
+  expect(replacementAttempts).toBe(0);
 });
 
 test("closing the launcher page is an immediate terminal turn error", async () => {
