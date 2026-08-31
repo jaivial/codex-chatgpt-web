@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import { chromium } from "patchright";
+import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import {
   atomicWriteFile,
   CHATGPT_CONNECTOR_NAME,
@@ -1551,6 +1552,7 @@ export class ChatGptBrowserWorker {
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
+  private lastTurnActivityAt = 0;
   private readonly activeRuns = new Map<string, Promise<string>>();
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
@@ -1736,7 +1738,7 @@ export class ChatGptBrowserWorker {
     this.browser = await chromium.launch({
       executablePath: this.config.chromeExecutablePath,
       headless: !this.config.headed,
-    });
+    }) as unknown as Browser;
     this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
     this.page = await this.context.newPage();
     return this.page;
@@ -1754,7 +1756,7 @@ export class ChatGptBrowserWorker {
       const browser = await chromium.launch({
         executablePath: this.config.chromeExecutablePath,
         headless: !this.config.headed,
-      });
+      }) as unknown as Browser;
       const context = await browser.newContext({ storageState: this.config.storageStatePath });
       this.browser = browser;
       this.context = context;
@@ -3451,8 +3453,9 @@ export class ChatGptBrowserWorker {
           maxMessageChars,
         );
       }
+      // Cap unbounded turns: codex background-terminal waits must not hang the SSE forever.
       const deadline = this.config.turnTimeoutMs === undefined
-        ? undefined
+        ? Date.now() + 30 * 60_000
         : Date.now() + this.config.turnTimeoutMs;
       let page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
         if (maintenancePage) return maintenancePage;
@@ -3526,6 +3529,19 @@ export class ChatGptBrowserWorker {
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
       );
+      if (reuseConversation && Date.now() - this.lastTurnActivityAt > 120_000) {
+        // Long idle gaps (codex background terminals) let ChatGPT drop the temp-chat
+        // stream; reload the surface before sending or the stage send stalls forever.
+        await this.runStage(
+          turn.traceId,
+          "idle_reconnect_preparation",
+          browserStageTimeouts.temporaryChatPreparation,
+          () => this.prepareTemporaryChatSurface(
+            page,
+            checkpoint => diagnostics.capture(page, checkpoint),
+          ),
+        );
+      }
       if (!reuseConversation) {
         await this.runStage(
           turn.traceId,
@@ -3963,6 +3979,7 @@ export class ChatGptBrowserWorker {
       }
       throw error;
     } finally {
+      this.lastTurnActivityAt = Date.now();
       prepared.release();
       if (turnConnection) {
         await turnConnection.close().catch(error => {

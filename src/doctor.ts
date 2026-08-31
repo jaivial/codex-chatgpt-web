@@ -3,6 +3,8 @@ import type { AppConfig } from "./config";
 import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
+import { runCommand } from "./process";
+import { userInfo } from "node:os";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
@@ -136,6 +138,25 @@ export async function runDoctor(): Promise<DoctorReport> {
     } else {
       checks.push({ id: "login", status: "ok", message: "ChatGPT login state has authenticated browser evidence" });
     }
+    if (process.platform === "linux") {
+      const xvfb = runCommand("which", ["Xvfb"]);
+      checks.push(xvfb.status === 0
+        ? { id: "xvfb", status: "ok", message: "Xvfb is available for headless login fallback" }
+        : { id: "xvfb", status: "warning", message: "Xvfb is not installed; login fallback unavailable (apt install xvfb)" });
+      let lingerStatus: CheckStatus = "warning";
+      let lingerMessage = "Could not verify linger; the daemon stops when your last session ends";
+      const linger = runCommand("loginctl", ["show-user", userInfo().username, "-p", "Linger"]);
+      if (linger.status === 0) {
+        lingerMessage = linger.stdout.trim();
+        lingerStatus = linger.stdout.trim() === "Linger=yes" ? "ok" : "warning";
+      }
+      checks.push({ id: "linger", status: lingerStatus, message: lingerMessage });
+      checks.push({
+        id: "browser-host",
+        status: "ok",
+        message: `Browser host mode: ${config.browserHost}${config.browserHost === "managed-chrome" ? (config.headed ? " (headed)" : " (headless)") : ""}`,
+      });
+    }
   }
 
   const codex = inspectCodexIntegration();
@@ -160,9 +181,9 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else if (!service.supported) {
     checks.push({ id: "service", status: "warning", message: "Managed service is unavailable on this OS; keep `serve` running manually" });
   } else if (!service.installed || !service.loaded) {
-    checks.push({ id: "service", status: "error", message: "macOS background service is not installed and loaded" });
+    checks.push({ id: "service", status: "error", message: "Background service is not installed and loaded" });
   } else {
-    checks.push({ id: "service", status: "ok", message: "macOS background service is loaded" });
+    checks.push({ id: "service", status: "ok", message: "Background service is loaded" });
   }
   checks.push(await proxyCheck(config));
 

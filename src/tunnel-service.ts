@@ -44,8 +44,39 @@ function settings(config: AppConfig) {
 
 function assertMacOs(): void {
   if (process.platform !== "darwin") {
-    throw new Error("Managed tunnel service installation is currently supported on macOS only");
+    throw new Error("launchd-managed tunnel service requires macOS; on Linux use systemd user units");
   }
+}
+
+function isLinux(): boolean {
+  return process.platform === "linux";
+}
+
+function systemdUnitPath(): string {
+  return join(homedir(), ".config", "systemd", "user", `${LABEL}.service`);
+}
+
+function systemdUnit(config: AppConfig): string {
+  const tunnel = settings(config);
+  const args = [tunnel.binaryPath, "run", "--profile-dir", tunnel.profileDir, "--profile", tunnel.profileName];
+  return `# Managed by codex-chatgpt-web; \`codex-chatgpt-web tunnel uninstall\` removes this unit.
+[Unit]
+Description=Codex Web GPT tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${args.join(" ")}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function systemctl(...args: string[]): ReturnType<typeof runCommand> {
+  return runCommand("systemctl", ["--user", ...args]);
 }
 
 export function tunnelServiceDefinition(config: AppConfig): string {
@@ -85,6 +116,18 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
 }
 
 export function getTunnelServiceStatus(): TunnelServiceStatus {
+  if (isLinux()) {
+    const path = systemdUnitPath();
+    const active = systemctl("is-active", "--quiet", LABEL).status === 0;
+    return {
+      supported: true,
+      installed: existsSync(path),
+      loaded: active,
+      running: active,
+      label: LABEL,
+      definitionPath: path,
+    };
+  }
   if (process.platform !== "darwin") {
     return { supported: false, installed: false, loaded: false, running: false, label: LABEL };
   }
@@ -106,6 +149,19 @@ export function tunnelServiceDefinitionMatches(config: AppConfig): boolean {
 }
 
 export function installTunnelService(config: AppConfig): TunnelServiceStatus {
+  if (isLinux()) {
+    const tunnel = settings(config);
+    const profile = join(tunnel.profileDir, `${tunnel.profileName}.yaml`);
+    if (!existsSync(tunnel.binaryPath)) throw new Error(`Tunnel client is missing: ${tunnel.binaryPath}`);
+    if (!existsSync(profile)) throw new Error(`Tunnel profile is missing: ${profile}`);
+    const path = systemdUnitPath();
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const next = systemdUnit(config);
+    if (!existsSync(path) || readFileSync(path, "utf8") !== next) atomicWriteFile(path, next);
+    systemctl("daemon-reload");
+    runChecked("systemctl", ["--user", "enable", "--now", LABEL]);
+    return getTunnelServiceStatus();
+  }
   assertMacOs();
   const tunnel = settings(config);
   const profile = join(tunnel.profileDir, `${tunnel.profileName}.yaml`);
@@ -124,6 +180,11 @@ export function installTunnelService(config: AppConfig): TunnelServiceStatus {
 }
 
 export function startTunnelService(): TunnelServiceStatus {
+  if (isLinux()) {
+    if (!existsSync(systemdUnitPath())) throw new Error("Tunnel service is not installed; rerun full setup");
+    runChecked("systemctl", ["--user", "start", LABEL]);
+    return getTunnelServiceStatus();
+  }
   assertMacOs();
   if (!existsSync(plistPath())) throw new Error("Tunnel service is not installed; rerun full setup");
   if (!getTunnelServiceStatus().loaded) runChecked("launchctl", ["bootstrap", launchDomain(), plistPath()]);
@@ -139,6 +200,10 @@ async function waitForTunnelServiceUnloaded(timeoutMs = 20_000): Promise<void> {
 }
 
 export async function stopTunnelService(): Promise<TunnelServiceStatus> {
+  if (isLinux()) {
+    if (getTunnelServiceStatus().loaded) runChecked("systemctl", ["--user", "stop", LABEL]);
+    return getTunnelServiceStatus();
+  }
   assertMacOs();
   if (getTunnelServiceStatus().loaded) {
     runChecked("launchctl", ["bootout", serviceTarget()]);
@@ -153,6 +218,12 @@ export async function restartTunnelService(): Promise<TunnelServiceStatus> {
 }
 
 export async function uninstallTunnelService(): Promise<TunnelServiceStatus> {
+  if (isLinux()) {
+    await stopTunnelService();
+    rmSync(systemdUnitPath(), { force: true });
+    systemctl("daemon-reload");
+    return getTunnelServiceStatus();
+  }
   assertMacOs();
   await stopTunnelService();
   rmSync(plistPath(), { force: true });

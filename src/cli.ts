@@ -3,8 +3,9 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
-import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
+import { checkBrowserEngine, loginToChatGpt, parseProxyUrl } from "./browser-login";
 import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
 import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
 import {
@@ -66,6 +67,19 @@ Setup options:
   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
+  --login-headless MODE        auto (default) | force | off for the login command; auto falls back to ephemeral Xvfb
+  --storage-state-file PATH    Import a Playwright storageState JSON instead of interactive login
+  --no-device                  Pure headless login: never opens windows/Xvfb; bot challenge
+                               fails hard. OTP arrives by e-mail (codex-style, no device).
+  --session-token-file PATH   File with __Secure-next-auth.session-token value (or full
+                               document.cookie / storageState JSON); or paste at prompt
+  --proxy URL                  Egress proxy for login browser (residential recommended on
+                               datacenter IPs): http://user:pass@host:port or socks5://...
+  --email EMAIL                Credential login: drives auth.openai.com headlessly; omit both
+                               --email/--password-file on a TTY for fully interactive prompts
+  --password-file PATH         File containing the ChatGPT password (0600); or env CODEX_CHATGPT_WEB_PASSWORD
+  --browser-host MODE          managed-chrome (headless default) | launcher for setup
+  --headless                   Setup turns run headless (managed-chrome, no display)
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --bigger-context             Enable experimental adaptive 1/2/3-message context
   --standard-context           Disable experimental multi-message context
@@ -143,12 +157,63 @@ function authorizeLauncherControl(operation: string): void {
 }
 
 async function loginCommand(args: string[]): Promise<void> {
+  const loginHeadless = takeOption(args, "--login-headless");
+  const storageStateFile = takeOption(args, "--storage-state-file");
+  let email = takeOption(args, "--email");
+  const passwordFile = takeOption(args, "--password-file");
+  const noDevice = takeFlag(args, "--no-device");
+  const sessionTokenFile = takeOption(args, "--session-token-file");
+  const proxyRaw = takeOption(args, "--proxy");
   assertNoArgs(args);
+  if (loginHeadless !== undefined && loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
+    throw new Error("--login-headless must be auto, force, or off");
+  }
+  // --no-device: pure headless, never spawn windows/Xvfb; bot challenge = hard error.
+  const effectiveLoginHeadless = noDevice || loginHeadless === "force" ? "force" as const : loginHeadless;
+  let sessionCookie: string | undefined;
+  if (sessionTokenFile) {
+    sessionCookie = readFileSync(sessionTokenFile, "utf8").trim();
+    if (!sessionCookie) throw new Error(`--session-token-file is empty: ${sessionTokenFile}`);
+  } else if (process.env.CODEX_CHATGPT_WEB_SESSION_COOKIE) {
+    sessionCookie = process.env.CODEX_CHATGPT_WEB_SESSION_COOKIE;
+  } else if (!passwordFile && !email && !storageStateFile && stdin.isTTY && stdout.isTTY) {
+    stdout.write("Paste __Secure-next-auth.session-token from a logged-in chatgpt.com (DevTools > Application > Cookies), or full document.cookie / storageState JSON.\n");
+    sessionCookie = await secretPrompt("Session cookie: ");
+  }
+  let password: string | undefined;
+  if (passwordFile) {
+    password = readFileSync(passwordFile, "utf8").replace(/\r?\n$/, "");
+    if (!password) throw new Error(`--password-file is empty: ${passwordFile}`);
+  } else if (email) {
+    password = process.env.CODEX_CHATGPT_WEB_PASSWORD;
+    if (!password) throw new Error("Credential login needs --password-file or CODEX_CHATGPT_WEB_PASSWORD");
+  } else if (!storageStateFile && stdin.isTTY && stdout.isTTY) {
+    // Interactive CLI login (codex-style): hidden password prompt, e-mail OTP prompt mid-flow.
+    email = await prompt("ChatGPT e-mail: ");
+    if (!email) throw new Error("An e-mail is required for interactive login");
+    password = await secretPrompt("ChatGPT password (hidden): ");
+    if (!password) throw new Error("A password is required for interactive login");
+  }
+  if ((email === undefined) !== (password === undefined)) {
+    throw new Error("--email requires --password-file (or CODEX_CHATGPT_WEB_PASSWORD); they are used together");
+  }
+  if (sessionCookie && (email || password)) {
+    throw new Error("Session-cookie login is exclusive of credential login");
+  }
   const config = loadConfig();
   if (config.browserHost === "launcher") {
     throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
   }
-  const result = await loginToChatGpt(config);
+  const result = await loginToChatGpt(config, {
+    ...(proxyRaw ? { proxy: parseProxyUrl(proxyRaw) } : {}),
+    ...(sessionCookie ? { sessionCookie } : {}),
+    ...(effectiveLoginHeadless !== undefined ? { loginHeadless: effectiveLoginHeadless } : {}),
+    ...(storageStateFile ? { storageStateFile } : {}),
+    ...(email && password ? { email, password } : {}),
+    mfaCodePrompt: email && password && stdin.isTTY && stdout.isTTY
+      ? () => prompt("ChatGPT e-mail verification code (check your inbox): ")
+      : undefined,
+  });
   stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
 }
 
@@ -174,6 +239,19 @@ async function setupCommand(args: string[]): Promise<void> {
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
+  const browserHost = takeOption(args, "--browser-host");
+  if (browserHost !== undefined && browserHost !== "managed-chrome" && browserHost !== "launcher") {
+    throw new Error("--browser-host must be managed-chrome or launcher");
+  }
+  if (browserHost) options.browserHost = browserHost;
+  if (takeFlag(args, "--headless")) options.headed = false;
+  const loginHeadless = takeOption(args, "--login-headless");
+  if (loginHeadless !== undefined) {
+    if (loginHeadless !== "auto" && loginHeadless !== "force" && loginHeadless !== "off") {
+      throw new Error("--login-headless must be auto, force, or off");
+    }
+    options.loginHeadless = loginHeadless as "auto" | "force" | "off";
+  }
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
