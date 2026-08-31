@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { chromium } from "patchright";
+import { installTurnstileAutoSolver } from "patchright-difz";
 import type { BrowserContextOptions, Page } from "patchright-core";
 import { runCommand } from "./process";
 import type { AppConfig } from "./config";
@@ -138,12 +139,29 @@ async function attemptCredentialLogin(
     args: CHROME_LAUNCH_ARGS,
     ...(proxy ? { proxy } : {}),
   });
+  const uninstallTurnstileSolver = installTurnstileAutoSolver(context);
   let page: Page | undefined;
   try {
     page = context.pages()[0] ?? await context.newPage();
-    await page.goto(AUTH_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    // Session probe: valid stored session lands straight on composer — no auth needed.
+    try {
+      await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      await composerLocator(page).waitFor({ state: "visible", timeout: 20_000 }).catch(() => {});
+      if (await composerLocator(page).isVisible().catch(() => false)) {
+        return await finalizeLogin(config, context, page, headless);
+      }
+    } catch (probeError) {
+      if (!/ERR_ABORTED/.test(String(probeError))) console.error(`[login] session probe failed, continuing to auth form: ${String(probeError).slice(0, 120)}`);
+    }
+    try {
+      await page.goto(AUTH_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    } catch (gotoError) {
+      // Logged-in profile redirects mid-goto (ERR_ABORTED) straight to chatgpt.com — expected.
+      if (!/ERR_ABORTED/.test(String(gotoError))) throw gotoError;
+    }
     // Turnstile interstitial: click the widget container so managed/checkbox mode resolves.
-    for (let turnstileAttempt = 0; turnstileAttempt < 8; turnstileAttempt += 1) {
+    const alreadyOnChatgpt = /chatgpt\.com/.test(page.url());
+    if (!alreadyOnChatgpt) for (let turnstileAttempt = 0; turnstileAttempt < 8; turnstileAttempt += 1) {
       const emailReady = await page.locator('input[name="email"], input#email-input, input[type="email"]').first()
         .isVisible({ timeout: 5_000 }).catch(() => false);
       if (emailReady) break;
@@ -154,6 +172,8 @@ async function attemptCredentialLogin(
       await page.waitForTimeout(5_000);
     }
     const emailInput = page.locator('input[name="email"], input#email-input, input[type="email"]').first();
+    const emailFormVisible = await emailInput.isVisible().catch(() => false);
+    if (emailFormVisible) {
     await emailInput.waitFor({ state: "visible", timeout: 60_000 });
     await emailInput.fill(email);
     await page.getByRole("button", { name: /continue/i }).first().click();
@@ -174,12 +194,18 @@ async function attemptCredentialLogin(
       if (await continueButton.isVisible().catch(() => false)) await continueButton.click();
       await page.waitForTimeout(1_500);
     }
-    await page.waitForURL(/chatgpt\.com/, { timeout: 120_000 });
+    if (emailFormVisible) {
+      await page.waitForURL(/chatgpt\.com/, { timeout: 120_000 });
+    }
     await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
     const composer = composerLocator(page);
     try {
       await composer.waitFor({ state: "visible", timeout: timeoutMs });
     } catch {
+      const diag = JSON.stringify({
+        u: page.url().slice(0, 140),
+        t: (await page.title().catch(() => "?")).slice(0, 60),
+      }).replace(/"/g, "'");
       if (await headlessLoginBlocked(page)) {
         const d = await page.evaluate(() => ({
           u: location.href.slice(0, 140),
@@ -189,7 +215,8 @@ async function attemptCredentialLogin(
         })).catch(() => "diagfail");
         throw new Error(`CREDENTIAL_LOGIN_BLOCKED: ${JSON.stringify(d)}`);
       }
-      throw new Error("Credential login finished but no ChatGPT composer appeared (check email/password or complete any verification manually)");
+      throw new Error(`Credential login composer fail | ${diag}`);
+    }
     }
     return await finalizeLogin(config, context, page, headless);
   } catch (error) {
@@ -204,6 +231,7 @@ async function attemptCredentialLogin(
     }
     throw error;
   } finally {
+    uninstallTurnstileSolver?.();
     await context.close();
   }
 }

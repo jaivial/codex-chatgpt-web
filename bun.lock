@@ -9,6 +9,7 @@
         "chromium-bidi": "12.1.0",
         "fflate": "^0.8.2",
         "patchright": "^1.62.2",
+        "patchright-difz": "^1.0.4",
         "playwright-core": "^1.62.0",
         "tiktoken": "1.0.22",
         "turndown": "7.2.0",
@@ -178,6 +179,8 @@
     "patchright": ["patchright@1.62.2", "", { "dependencies": { "patchright-core": "1.62.2" }, "optionalDependencies": { "fsevents": "2.3.2" }, "bin": { "patchright": "cli.js" } }, "sha512-IAj57p3NhXWJH3SlOCooDa/OoRveulUW1n/H6SY79S0j0sRd/0LLfBH9VMYDkDw5LUOlF0tCp3vkWMfOTiHsXQ=="],
 
     "patchright-core": ["patchright-core@1.62.2", "", { "bin": { "patchright-core": "cli.js" } }, "sha512-XDl3HB/Kjm9ZBFn4ygD5mxdsqK4aIWNGXdea46XAGd0hvHuJJ84w1M83JqofpXIbD2aJfQ2Rtz4YcqPVrxjSzw=="],
+
+    "patchright-difz": ["patchright-difz@1.0.4", "", { "dependencies": { "patchright": "^1.59.4" } }, "sha512-l5vwZPN3b9AaMOWeV77SaY479vxHC09x0A3DzUePwve/XMQQf2RdZ4lxoAudV0sD6vecrfQiuFmkc2Di3rPtCw=="],
 
     "path-key": ["path-key@3.1.1", "", {}, "sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q=="],
 
