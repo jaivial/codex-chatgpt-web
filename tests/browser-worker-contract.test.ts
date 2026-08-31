@@ -1078,6 +1078,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
   const visibleControls = { count: async () => 0 };
   const composerForm = {
     locator: () => ({ filter: () => visibleControls }),
+    getByRole: () => ({ filter: () => ({ count: async () => 0 }) }),
   };
   const composer = { locator: () => composerForm };
   const selectModelAndEffort = (ChatGptBrowserWorker.prototype as unknown as {
