@@ -758,6 +758,13 @@ export async function callTurnBroker<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const id = opaqueId("request");
+  const settleOnResponseFrame = timeoutMs === null;
+  // The wire protocol requires a client-owned activity identity. Most callers never need to see
+  // it; the MCP server supplies its own so it can retire an ambiguously delivered claim, while
+  // lower-level diagnostics receive an equally client-generated identity here.
+  const wireRequest = request.method === "claim" && request.activityId === undefined
+    ? { ...request, activityId: opaqueId("activity") }
+    : request;
   return new Promise<T>((resolveCall, rejectCall) => {
     const socket = createConnection(socketPath);
     let buffered = "";
@@ -820,6 +827,12 @@ export async function callTurnBroker<T>(
         return;
       }
       response = parsed;
+      if (settleOnResponseFrame) {
+        // A long-poll keeps its request half open while the server waits. Its complete response
+        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
+        finishResponse();
+        socket.destroy();
+      }
     });
   });
 }
