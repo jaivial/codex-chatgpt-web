@@ -1381,6 +1381,12 @@ function SettingsSurface({
               .catch((cause) => setError(messageOf(cause)))}
           />
         </SettingRow> : null}
+        <InteractionModePicker
+          copy={copy}
+          disabled={busy}
+          mode={snapshot.state.browserInteractionMode}
+          onChange={(mode) => void setInteractionMode(mode)}
+        />
         <SettingRow body={devProfile ? copy.devKeepRunningBody : copy.keepRunningOnCloseBody} label={copy.keepRunningOnClose}>
           <Switch
             checked={snapshot.state.keepRunningOnClose}
