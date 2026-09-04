@@ -142,26 +142,22 @@ Full mode connects ChatGPT's tool calls back to the current Codex task through t
 [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound: it does
 not expose a public IP, open an inbound port, or require router forwarding.
 
-> [!WARNING]
-> Create a **new** connector named **Codex Native2** and set its permissions to
-> **Allow all actions**. Do not rename, refresh, or reuse an older **Codex Native** connector:
-> ChatGPT caches the public MCP contract by connector identity, and **Allow low-risk actions**
-> blocks commands and patches before they reach the Codex harness.
+The launcher's **MCP** page guides the complete setup. For the exact clicks, see the
+[video walkthroughs](TROUBLESHOOTING.md).
 
-1. Finish the required launcher setup.
-2. Open **MCP** in the launcher. Create the Tunnel and a regular API key on the same OpenAI account
-   that will use the ChatGPT connector; creating the key is free and does not consume model API
-   credits.
-3. Paste the Tunnel ID and API key, then press **Connect harness**.
-4. Enable **Developer Mode** in ChatGPT settings. Create a **new** connector using **Tunnel**, select
-   that exact Tunnel, set **Authentication** to **None**, and name it exactly **Codex Native2**.
-5. If an older **Codex Native** connector exists, leave it untouched. Do not rename or refresh it:
-   ChatGPT caches the public MCP contract by connector identity, and this release uses a new direct
-   turn-token contract. Under **Permissions** on **Codex Native2**, choose **Allow all actions**;
-   **Allow low-risk actions** blocks commands and patches before they reach this runtime. The outer
-   Codex harness still enforces its sandbox and approvals.
-6. Run **Verify runtime**. It selects **Codex Native2** exactly. If only **Codex Native** is found,
-   verification fails with an explicit migration error instead of accepting the legacy connector.
+> **Limits**
+>
+> See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for the current
+> ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Astra**. Context limits depend on
+> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window, or
+> up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
+> supported throughout.
+
+1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
+   **Connect harness**.
+2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
+   **Codex Native2**, with **Authentication: None** and **Allow all actions**.
+3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
