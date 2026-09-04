@@ -407,6 +407,19 @@ export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope):
   );
 }
 
+const chatGptMessageTooLongAlert = (page: Page): Locator => page
+  .locator('[role="alert"]')
+  .filter({ hasText: /message you submitted was too long/i })
+  .last();
+
+export async function throwIfChatGptMessageTooLongAlert(page: Page): Promise<void> {
+  if (!await chatGptMessageTooLongAlert(page).isVisible().catch(() => false)) return;
+  throw new ChatGptWebAdapterError(
+    "ChatGPT rejected a staged message as too long for the accumulated conversation. Compact the Codex task (for example /compact) and retry the turn.",
+    { status: 400, errorType: "invalid_request_error", code: "chatgpt_message_too_long", retryable: false },
+  );
+}
+
 export async function resolveChatGptToolConfirmation(
   page: Page,
   appName: string,
@@ -499,7 +512,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
   maxMessageChars: number,
-  partCount: 2 | 3,
+  partCount: number,
   transport?: {
     stagingEffort: ChatGptWebModelMode["effort"];
     maxStageMessageTokens: number;
@@ -864,6 +877,7 @@ export class ChatGptTurnDomHealthTracker {
     running: boolean;
     currentText: string;
     completionActionVisible: boolean;
+    streamingStatusVisible?: boolean;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) {
       this.sawResponse = true;
@@ -892,6 +906,10 @@ export class ChatGptTurnDomHealthTracker {
 
     const missingCompletionAction = state.responsePresent
       && !state.running
+      // A live status container (tool/activity pill) means the connector turn is still
+      // executing even when generation looks stopped; a background terminal can hold that
+      // state with static text far beyond the completion-action grace window.
+      && state.streamingStatusVisible !== true
       && state.currentText.length > 0
       && !state.completionActionVisible;
     if (!missingCompletionAction) {
@@ -947,6 +965,7 @@ interface ChatGptResponseDomSnapshot {
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
   stoppedThinkingVisible: boolean;
+  streamingStatusVisible: boolean;
   traceBlocks: ChatGptVisibleTraceBlock[];
 }
 
@@ -964,6 +983,7 @@ const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   markdownSegments: [],
   completionActionVisible: false,
   stoppedThinkingVisible: false,
+  streamingStatusVisible: false,
   traceBlocks: [],
 });
 
@@ -1074,6 +1094,10 @@ class ChatGptBrowserDiagnostics {
   private readonly directory: string;
   private sequence = 0;
   private initialized = false;
+  // Serialize disk I/O across concurrent captures so sequence numbers stay monotonic and
+  // capture-N.png / capture-N.json pairs never overlap on disk. The queue is never awaited
+  // by callers — see `capture()` below — it just keeps writes from racing each other.
+  private captureQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly traceId: string, private readonly root: string) {
     if (!/^[A-Za-z0-9_-]{6,128}$/.test(traceId)) {
@@ -1083,6 +1107,15 @@ class ChatGptBrowserDiagnostics {
   }
 
   async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {
+    // Fire-and-forget: the polling loop should not block on screenshot I/O (page.screenshot has a
+    // 5s timeout that can stall the whole turn when the renderer is slow). Disk writes still run
+    // serially through `captureQueue` so the captured files land in the right order.
+    this.captureQueue = this.captureQueue
+      .catch(() => {})
+      .then(() => this.captureBody(page, checkpoint, error));
+  }
+
+  private async captureBody(page: Page, checkpoint: string, error?: unknown): Promise<void> {
     try {
       if (!this.initialized) {
         privateDirectory(this.root);
@@ -2344,6 +2377,7 @@ export class ChatGptBrowserWorker {
         throw new Error("ChatGPT Bigger Context transaction timed out while awaiting a stage acknowledgement");
       }
       await throwIfChatGptSessionFailureAlert(page);
+      await throwIfChatGptMessageTooLongAlert(page);
       await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
       let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
       if (!snapshot.responsePresent && await responseTurn.locator.count() !== 1) {
@@ -2364,6 +2398,7 @@ export class ChatGptBrowserWorker {
         running,
         currentText: snapshot.visibleText,
         completionActionVisible: snapshot.completionActionVisible,
+        streamingStatusVisible: snapshot.streamingStatusVisible,
       });
       if (domError) throw new Error(domError);
       if (completionTracker.update({
@@ -2894,6 +2929,11 @@ export class ChatGptBrowserWorker {
         }
         return false;
       })();
+      // A connector turn can keep working (for example a background terminal waiting on output)
+      // with the stop button hidden and no text growth for minutes. The live status container is
+      // the only DOM signal that the turn is still executing in that state.
+      const streamingStatusVisible = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
+        .some(container => renderedInDom(container) && container.innerText.trim().length > 0);
       return {
         key: observerKey,
         snapshot: {
@@ -2903,6 +2943,7 @@ export class ChatGptBrowserWorker {
           markdownSegments,
           completionActionVisible: completionAction !== undefined,
           stoppedThinkingVisible,
+          streamingStatusVisible,
           traceBlocks,
         },
       };
@@ -3427,6 +3468,15 @@ export class ChatGptBrowserWorker {
       let loggedCompletionWait = false;
       let capturedResponse = false;
       const sentAt = Date.now();
+      // Poll cadence: keep it tight once a snapshot exists (ChatGPT is streaming, the user sees
+      // deltas faster), back off before the first snapshot (give the DOM time to settle without
+      // burning CPU on empty scans). Reuses the existing responseDomCache to decide.
+      const POLL_LIVE_MS = 100;
+      const POLL_IDLE_MS = 250;
+      const pollSleep = () => new Promise<void>(resolveSleep => setTimeout(
+        resolveSleep,
+        responseDomCache.snapshot ? POLL_LIVE_MS : POLL_IDLE_MS,
+      ));
       const visibleTrace = new ChatGptVisibleTraceTracker();
       const markdownBuffer = new ChatGptMarkdownBuffer();
       const checkpointStream = turn.captureLunaCheckpoint
@@ -3468,6 +3518,7 @@ export class ChatGptBrowserWorker {
         }
 
         await throwIfChatGptSessionFailureAlert(page);
+        await throwIfChatGptMessageTooLongAlert(page);
         await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
 
         if (mode.localTools && await resolveChatGptToolConfirmation(
@@ -3478,7 +3529,7 @@ export class ChatGptBrowserWorker {
           CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS,
           () => diagnostics.capture(page, "tool-confirmation-visible"),
         )) {
-          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          await pollSleep();
           continue;
         }
 
@@ -3532,7 +3583,7 @@ export class ChatGptBrowserWorker {
           // Current-turn MCP activity proves that ChatGPT is still executing even if its renderer
           // temporarily cannot expose the response subtree. DOM remains authoritative for text and
           // completion; this only prevents a live turn from being misclassified as vanished.
-          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          await pollSleep();
           continue;
         }
         const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
@@ -3560,6 +3611,7 @@ export class ChatGptBrowserWorker {
             running,
             currentText: snapshot.visibleText,
             completionActionVisible: snapshot.completionActionVisible,
+            streamingStatusVisible: snapshot.streamingStatusVisible,
           });
           if (domError) throw new Error(domError);
           if (completionTracker.update({
@@ -3604,6 +3656,13 @@ export class ChatGptBrowserWorker {
               `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
             );
           }
+          // Hard timeout: if the browser stalls past this many seconds, fail the turn so the
+          // finally block can notify the launcher (`phase: end`, status: failed) and free the
+          // broker channel instead of leaking a never-ending heartbeat.
+          const CHATGPT_BROWSER_TURN_HARD_TIMEOUT_MS = 5 * 60_000;
+          if (Date.now() - sentAt >= CHATGPT_BROWSER_TURN_HARD_TIMEOUT_MS) {
+            throw new Error(`ChatGPT browser stalled for ${CHATGPT_BROWSER_TURN_HARD_TIMEOUT_MS / 1000}s after submit; aborting turn ${turn.traceId}`);
+          }
         } else {
           const domError = domHealthTracker.update({
             responsePresent: false,
@@ -3613,7 +3672,7 @@ export class ChatGptBrowserWorker {
           });
           if (domError) throw new Error(domError);
         }
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+        await pollSleep();
       }
 
       if (this.context && this.config.browserHost === "managed-chrome") {

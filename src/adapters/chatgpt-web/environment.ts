@@ -158,7 +158,13 @@ function environmentBeforeUser(input: unknown[], userIndex: number, expectedTurn
   if (candidate?.type !== "message" || candidate.role !== "user") return undefined;
 
   const candidateTurnId = itemTurnId(candidate);
-  if (candidateTurnId !== userTurnId) return undefined;
+  // Codex CLI 0.153.x ships the per-turn <environment_context> carrier as a server-owned user
+  // message with no `internal_chat_message_metadata_passthrough` — its identity is the server id,
+  // not the turn id of the active instruction. Accept the carrier when either its turn id matches
+  // the active user or it's a server-owned item without a (possibly stale) conflicting turn id.
+  const candidateServerOwned = typeof candidate.id === "string" && candidate.id.length > 0;
+  if (candidateTurnId !== undefined && candidateTurnId !== userTurnId) return undefined;
+  if (candidateTurnId === undefined && !candidateServerOwned) return undefined;
 
   const content = Array.isArray(candidate.content) ? candidate.content : [];
   for (const part of content) {
