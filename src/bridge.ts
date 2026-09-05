@@ -435,6 +435,13 @@ export function bridgeToResponsesSSE(
             if (event.type !== "done" && event.type !== "incomplete" && event.type !== "error") continue;
           }
           switch (event.type) {
+            case "heartbeat": {
+              // Adapter-driven keepalive: mirror the bridge's own setInterval heartbeat to
+              // Codex so a quiet phase never leaves the SSE stream idle long enough for reqwest
+              // to surface "error decoding response body" before the stall budget fires.
+              emit("response.heartbeat", {});
+              break;
+            }
             case "assistant_boundary": {
               // A guarded continuation starts a fresh assistant output item while keeping the
               // intermediate, suspicious text in the same Responses turn.
@@ -735,7 +742,10 @@ export function bridgeToResponsesSSE(
 
       const startStream = () => {
         emit("response.created", { response: responseSnapshot("in_progress", []) });
-        gated = true;
+        // gated defaults to false after startStream so the bridge's own heartbeat fires
+        // during adapter silence. Without this, a long silent phase (e.g. browser working on a
+        // long task with no assistant text yet) sends zero bytes to Codex, which trips its
+        // reqwest stream decoder with "error decoding response body" before the stall timeout.
         beat = setInterval(() => {
           if (closed || gated) return;
           const checkedAt = now();
