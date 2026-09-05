@@ -40,6 +40,15 @@ export interface CodexUserMessage {
   timestamp: number;
 }
 
+/** A readable MultiAgent message delivered between native Codex agents. */
+export interface CodexAgentMessage {
+  role: "agentMessage";
+  author?: string;
+  recipient?: string;
+  content: string | CodexContentPart[];
+  timestamp: number;
+}
+
 export interface CodexAssistantMessage {
   role: "assistant";
   content: CodexAssistantContentPart[];
